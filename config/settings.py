@@ -14,6 +14,7 @@ Dual-mode credentials:
 """
 
 from decimal import Decimal
+from pathlib import Path
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
 
@@ -31,6 +32,12 @@ class Settings(BaseSettings):
 
     kalshi_demo_api_key_id: str = ""
     kalshi_demo_private_key_path: str = "./keys/kalshi-demo.pem"
+
+    # PEM contents injected via env vars (Railway / container deploys where
+    # files aren't available). If set, ensure_key_files() materializes them
+    # to the *_private_key_path locations before any client is built.
+    kalshi_prod_private_key_content: str = ""
+    kalshi_demo_private_key_content: str = ""
 
     # Which env is "active" for authenticated trading endpoints.
     # Public endpoints always hit prod regardless of this setting.
@@ -132,3 +139,27 @@ class Settings(BaseSettings):
 
 # Singleton — import this everywhere
 settings = Settings()
+
+
+def ensure_key_files() -> None:
+    """Materialize PEM contents from env vars into files on disk.
+
+    Railway (and similar PaaS) can't mount PEM files, so we pass the key
+    material as an env var and write it out at process start. Literal '\\n'
+    sequences in the env value are converted to real newlines, since most
+    dashboards mangle multi-line input.
+    """
+    pairs = (
+        (settings.kalshi_prod_private_key_content, settings.kalshi_prod_private_key_path),
+        (settings.kalshi_demo_private_key_content, settings.kalshi_demo_private_key_path),
+    )
+    for content, path in pairs:
+        if not content:
+            continue
+        pem = content.replace("\\n", "\n")
+        if not pem.endswith("\n"):
+            pem += "\n"
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(pem)
+        dest.chmod(0o600)

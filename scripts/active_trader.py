@@ -38,6 +38,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Railway / container deploys pass PEM key material as env vars; write it to
+# disk BEFORE importing anything that builds a Kalshi REST client, since
+# client construction reads the PEM file eagerly.
+from config.settings import ensure_key_files
+ensure_key_files()
+
+# Force line-buffered stdout/stderr so Railway's log stream flushes promptly
+# instead of waiting for a full buffer (container stdout is a pipe, not a tty).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
 from rich.console import Console
 from rich.table import Table
 from rich import box
