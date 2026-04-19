@@ -1,0 +1,224 @@
+"""
+Database models and connection.
+
+Uses SQLAlchemy ORM. Starts with SQLite for simplicity —
+swap DATABASE_URL to PostgreSQL when you're ready to scale.
+"""
+
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from sqlalchemy import (
+    Column, DateTime, Integer, Numeric, String, Text, JSON,
+    ForeignKey, create_engine, event,
+)
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker, relationship
+
+from config.settings import settings
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Market(Base):
+    __tablename__ = "markets"
+
+    ticker = Column(String, primary_key=True)
+    series_ticker = Column(String, index=True)
+    event_ticker = Column(String, index=True)
+    title = Column(Text)
+    category = Column(String, index=True)
+    status = Column(String, index=True)
+    yes_bid = Column(Numeric)
+    no_bid = Column(Numeric)
+    volume = Column(Numeric)
+    close_time = Column(DateTime(timezone=True))
+    result = Column(String, nullable=True)  # "yes", "no", or null
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class Signal(Base):
+    __tablename__ = "signals"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market_ticker = Column(String, ForeignKey("markets.ticker"), index=True)
+    strategy = Column(String, index=True)
+    model_prob = Column(Numeric)
+    market_prob = Column(Numeric)
+    edge = Column(Numeric)
+    confidence = Column(Numeric)
+    features = Column(JSON)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    order_id = Column(String, primary_key=True)
+    client_order_id = Column(String, unique=True)
+    market_ticker = Column(String, ForeignKey("markets.ticker"), index=True)
+    strategy = Column(String)
+    action = Column(String)  # "buy" or "sell"
+    side = Column(String)    # "yes" or "no"
+    price_cents = Column(Integer)
+    count = Column(Integer)
+    status = Column(String, index=True)
+    fill_count = Column(Integer, default=0)
+    signal_id = Column(Integer, ForeignKey("signals.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    fills = relationship("Fill", back_populates="order")
+
+
+class Fill(Base):
+    __tablename__ = "fills"
+
+    fill_id = Column(String, primary_key=True)
+    order_id = Column(String, ForeignKey("orders.order_id"), index=True)
+    market_ticker = Column(String)
+    side = Column(String)
+    price_cents = Column(Integer)
+    count = Column(Integer)
+    trade_fee = Column(Numeric)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    order = relationship("Order", back_populates="fills")
+
+
+class PortfolioSnapshot(Base):
+    __tablename__ = "portfolio_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    balance = Column(Numeric)
+    positions_value = Column(Numeric)
+    unrealized_pnl = Column(Numeric)
+    realized_pnl = Column(Numeric)
+    snapshot_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PaperTrade(Base):
+    """
+    A logged but NOT-executed trade used for strategy validation.
+
+    Paper trades are recorded by scripts/paper_trader.py when a signal
+    clears both the strategy's tradeability gate and the Kelly sizer.
+    scripts/paper_settle.py fills in result/pnl/settled_at once the
+    underlying Kalshi market resolves. Only settled rows contribute to
+    strategy performance metrics — unsettled rows are "open positions".
+    """
+    __tablename__ = "paper_trades"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String, index=True)
+    strategy = Column(String, index=True)
+    side = Column(String)                      # "yes" or "no"
+    entry_price = Column(Numeric)              # per-contract dollar cost at entry
+    contracts = Column(Integer)
+    cost = Column(Numeric)                     # entry_price * contracts
+    potential_profit = Column(Numeric)         # (1 - entry_price) * contracts
+
+    # Signal snapshot — frozen at trade time for post-hoc analysis
+    signal_edge = Column(Numeric)
+    signal_confidence = Column(String)
+    model_prob = Column(Numeric)
+    market_prob = Column(Numeric)
+    nws_high = Column(Integer, nullable=True)
+
+    placed_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    settled_at = Column(DateTime(timezone=True), nullable=True)
+    result = Column(String, nullable=True)     # "yes" / "no" (market result), or None
+    pnl = Column(Numeric, nullable=True)       # signed dollars
+
+
+class DebateLog(Base):
+    """
+    Every AI debate call is logged here for later calibration.
+
+    Rows are written when the debate runs (outcome fields null). Once
+    the market settles, a nightly job fills in `market_result` and
+    `was_correct` so we can compute Brier scores per model weekly.
+    """
+    __tablename__ = "debate_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String, index=True)
+    market_title = Column(Text)
+
+    bull_prob = Column(Numeric)
+    bear_prob = Column(Numeric)
+    judge_prob = Column(Numeric)
+    disagreement = Column(Numeric)
+
+    market_price = Column(Numeric)
+    edge = Column(Numeric)
+    side = Column(String)           # "yes" | "no" | "hold"
+    confidence = Column(Numeric)    # post disagreement-penalty
+    should_trade = Column(Integer)  # 0/1 as SQLite has no bool
+
+    total_cost = Column(Numeric)    # USD spent on this debate
+
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    # Filled in after settlement
+    market_result = Column(String, nullable=True)   # "yes" | "no"
+    was_correct = Column(Integer, nullable=True)    # 0/1
+
+
+class Position(Base):
+    """
+    Active trading position tracked by the position manager.
+
+    Lifecycle: open → closed_profit / closed_loss / settled
+    """
+    __tablename__ = "positions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String, index=True)
+    strategy = Column(String, index=True)
+    side = Column(String)                          # "yes" or "no"
+    entry_price = Column(Numeric)                  # per-contract dollar cost
+    contracts = Column(Integer)
+    entry_time = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    current_price = Column(Numeric, nullable=True)
+    unrealized_pnl = Column(Numeric, nullable=True)
+
+    exit_price = Column(Numeric, nullable=True)
+    exit_time = Column(DateTime(timezone=True), nullable=True)
+    exit_reason = Column(String, nullable=True)    # "profit_target", "stop_loss", "settled", "manual"
+    realized_pnl = Column(Numeric, nullable=True)
+
+    status = Column(String, index=True, default="open")  # open, closed_profit, closed_loss, settled
+
+    market_close_time = Column(DateTime(timezone=True), nullable=True)
+    market_result = Column(String, nullable=True)  # "yes" / "no" after settlement
+
+
+# ------------------------------------------------------------------
+# Engine & Session
+# ------------------------------------------------------------------
+
+engine = create_engine(settings.database_url, echo=False)
+
+# Enable WAL mode for SQLite (better concurrent reads)
+if "sqlite" in settings.database_url:
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+
+SessionLocal = sessionmaker(bind=engine)
+
+
+def init_db():
+    """Create all tables. Safe to call multiple times."""
+    Base.metadata.create_all(engine)
+
+
+def get_session() -> Session:
+    """Get a new database session. Remember to close it."""
+    return SessionLocal()

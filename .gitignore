@@ -1,0 +1,13 @@
+.env
+keys/
+*.pem
+*.key
+__pycache__/
+*.pyc
+*.db
+logs/
+data/market_scan_results.csv
+.vscode/
+*.egg-info/
+dist/
+build/

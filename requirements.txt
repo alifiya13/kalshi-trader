@@ -1,0 +1,33 @@
+# Kalshi Trading System — Dependencies
+# Install: pip install -r requirements.txt
+
+# === Core ===
+requests>=2.31.0
+websockets>=12.0
+cryptography>=42.0.0
+
+# === Data & Math ===
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+
+# === Database ===
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+alembic>=1.13.0
+
+# === Async ===
+aiohttp>=3.9.0
+
+# === Config & Environment ===
+python-dotenv>=1.0.0
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+
+# === Monitoring & Logging ===
+rich>=13.7.0               # pretty console output
+structlog>=24.1.0           # structured logging
+
+# === Dashboard ===
+streamlit>=1.31.0
+plotly>=5.18.0
