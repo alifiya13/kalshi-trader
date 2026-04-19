@@ -31,6 +31,9 @@ structlog>=24.1.0           # structured logging
 # === Dashboard ===
 streamlit>=1.31.0
 plotly>=5.18.0
+fastapi>=0.110.0
+uvicorn>=0.27.0
+jinja2>=3.1.0
 
 # === AI Debate ===
 openai>=1.12.0

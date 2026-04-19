@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Kalshi Trader</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  html, body { background: #0f1117; color: #e5e7eb; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Inter", "Segoe UI", sans-serif; }
+  .card { background: #161922; border: 1px solid #1f2330; border-radius: 12px; }
+  .muted { color: #8b93a7; }
+  .divide-row > * + * { border-top: 1px solid #1f2330; }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; }
+  th, td { padding: 10px 12px; font-size: 13px; }
+  thead th { text-align: left; font-weight: 600; color: #8b93a7; text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; background: #12151c; position: sticky; top: 0; }
+  tbody tr + tr td { border-top: 1px solid #1f2330; }
+  .mono { font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace; }
+  .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 10px #10b981; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .scroll-h { max-height: 440px; overflow: auto; }
+  .scroll-h::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scroll-h::-webkit-scrollbar-thumb { background: #2a2f3d; border-radius: 4px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+  .badge-demo { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+  .badge-prod { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+  .pill-yes { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+  .pill-no { background: rgba(244, 63, 94, 0.15); color: #fb7185; }
+  .pill-hold { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; }
+  .pill { padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- Top bar -->
+<header class="border-b border-[#1f2330] bg-[#0f1117]/95 backdrop-blur sticky top-0 z-10">
+  <div class="max-w-7xl mx-auto px-4 md:px-6 py-3 flex items-center justify-between gap-4 flex-wrap">
+    <div class="flex items-center gap-3">
+      <div class="pulse-dot"></div>
+      <span class="text-lg md:text-xl font-bold tracking-wide">KALSHI<span class="text-emerald-400"> TRADER</span></span>
+      <span id="env-badge" class="badge badge-demo">demo</span>
+    </div>
+    <div class="flex items-center gap-4 md:gap-6 text-sm">
+      <div class="flex flex-col items-end">
+        <span class="muted text-[10px] uppercase tracking-wider">Balance</span>
+        <span id="hdr-balance" class="mono font-semibold">—</span>
+      </div>
+      <div class="flex flex-col items-end">
+        <span class="muted text-[10px] uppercase tracking-wider">Uptime</span>
+        <span id="hdr-uptime" class="mono font-semibold">—</span>
+      </div>
+      <div class="flex flex-col items-end">
+        <span class="muted text-[10px] uppercase tracking-wider">Last sync</span>
+        <span id="hdr-sync" class="mono font-semibold">—</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 md:px-6 py-6 space-y-6">
+
+  <!-- Stat cards -->
+  <section class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
+    <div class="card p-4">
+      <div class="muted text-xs uppercase tracking-wider">Total P&amp;L</div>
+      <div id="stat-pnl" class="text-2xl md:text-3xl mono font-bold mt-1">$0.00</div>
+      <div id="stat-pnl-sub" class="text-xs muted mt-1">Realized · all strategies</div>
+    </div>
+    <div class="card p-4">
+      <div class="muted text-xs uppercase tracking-wider">Win Rate</div>
+      <div id="stat-winrate" class="text-2xl md:text-3xl mono font-bold mt-1">—</div>
+      <div id="stat-winrate-sub" class="text-xs muted mt-1">0W / 0L</div>
+    </div>
+    <div class="card p-4">
+      <div class="muted text-xs uppercase tracking-wider">Open Positions</div>
+      <div id="stat-open" class="text-2xl md:text-3xl mono font-bold mt-1">0</div>
+      <div id="stat-open-sub" class="text-xs muted mt-1">Currently live</div>
+    </div>
+    <div class="card p-4">
+      <div class="muted text-xs uppercase tracking-wider">Total Trades</div>
+      <div id="stat-total" class="text-2xl md:text-3xl mono font-bold mt-1">0</div>
+      <div id="stat-total-sub" class="text-xs muted mt-1">Best —  ·  Worst —</div>
+    </div>
+  </section>
+
+  <!-- P&L chart + Strategy breakdown -->
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div class="card p-4 lg:col-span-2">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold">Cumulative P&amp;L</h2>
+        <span class="text-xs muted">Closed trades, most-recent-first</span>
+      </div>
+      <div class="h-64 md:h-72"><canvas id="pnlChart"></canvas></div>
+    </div>
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold">By Strategy</h2>
+        <span class="text-xs muted">Realized</span>
+      </div>
+      <div id="strategy-breakdown" class="space-y-3"></div>
+    </div>
+  </section>
+
+  <!-- Open positions -->
+  <section class="card">
+    <div class="flex items-center justify-between p-4 border-b border-[#1f2330]">
+      <h2 class="font-semibold">Open Positions</h2>
+      <span id="open-count-lbl" class="text-xs muted">0 open</span>
+    </div>
+    <div class="scroll-h">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Side</th><th class="text-right">Entry</th><th class="text-right">Current</th>
+            <th class="text-right">Qty</th><th class="text-right">P&amp;L</th><th>Strategy</th><th>Age</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="open-positions-body"><tr><td colspan="9" class="muted text-center py-8">No open positions</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Recent closed trades -->
+  <section class="card">
+    <div class="flex items-center justify-between p-4 border-b border-[#1f2330]">
+      <h2 class="font-semibold">Recent Closed Trades</h2>
+      <span class="text-xs muted">Latest 50</span>
+    </div>
+    <div class="scroll-h">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Side</th><th class="text-right">Entry</th><th class="text-right">Exit</th>
+            <th class="text-right">Qty</th><th class="text-right">P&amp;L</th><th>Strategy</th><th>Reason</th><th>Closed</th>
+          </tr>
+        </thead>
+        <tbody id="closed-positions-body"><tr><td colspan="9" class="muted text-center py-8">No closed trades yet</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Debate log -->
+  <section class="card">
+    <div class="flex items-center justify-between p-4 border-b border-[#1f2330]">
+      <h2 class="font-semibold">AI Debate Log</h2>
+      <span class="text-xs muted">Last 50 debates</span>
+    </div>
+    <div class="scroll-h">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th><th class="text-right">Bull</th><th class="text-right">Bear</th>
+            <th class="text-right">Judge</th><th class="text-right">Mkt</th><th class="text-right">Edge</th>
+            <th>Side</th><th>Decision</th><th>When</th>
+          </tr>
+        </thead>
+        <tbody id="debate-body"><tr><td colspan="9" class="muted text-center py-8">No debates logged yet</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="text-xs muted text-center py-6">Auto-refresh every 10s · read-only view of the trader DB</footer>
+</main>
+
+<script>
+const REFRESH_MS = 10000;
+let pnlChart = null;
+
+const fmtUsd = (v) => {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  const sign = v >= 0 ? '' : '-';
+  return sign + '$' + Math.abs(Number(v)).toFixed(2);
+};
+const fmtUsdSigned = (v) => (v >= 0 ? '+' : '') + fmtUsd(v);
+const fmtPct = (v) => (v === null || v === undefined || isNaN(v)) ? '—' : (Number(v) * 100).toFixed(1) + '%';
+const fmtCents = (v) => (v === null || v === undefined || isNaN(v)) ? '—' : '$' + Number(v).toFixed(2);
+const pnlClass = (v) => (v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-slate-300');
+
+function fmtUptime(s) {
+  if (!s && s !== 0) return '—';
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); const sec = s - m * 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function relTime(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return '—';
+  const diff = Math.floor((Date.now() - t) / 1000);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  return r.json();
+}
+
+function sidePill(side) {
+  const s = (side || '').toLowerCase();
+  if (s === 'yes') return `<span class="pill pill-yes">YES</span>`;
+  if (s === 'no')  return `<span class="pill pill-no">NO</span>`;
+  if (s === 'hold') return `<span class="pill pill-hold">HOLD</span>`;
+  return `<span class="pill pill-hold">${s || '—'}</span>`;
+}
+
+function renderStatus(st) {
+  document.getElementById('env-badge').textContent = st.env || '—';
+  document.getElementById('env-badge').className = 'badge ' + (st.env === 'prod' ? 'badge-prod' : 'badge-demo');
+  document.getElementById('hdr-balance').textContent = st.balance === null || st.balance === undefined ? '—' : fmtUsd(st.balance);
+  document.getElementById('hdr-uptime').textContent = fmtUptime(st.uptime_seconds);
+  document.getElementById('hdr-sync').textContent = new Date().toLocaleTimeString();
+  document.getElementById('stat-open').textContent = st.open_positions ?? 0;
+}
+
+function renderStats(s) {
+  const pnlEl = document.getElementById('stat-pnl');
+  pnlEl.textContent = fmtUsdSigned(s.total_pnl);
+  pnlEl.className = 'text-2xl md:text-3xl mono font-bold mt-1 ' + pnlClass(s.total_pnl);
+  document.getElementById('stat-pnl-sub').textContent = `avg edge ${fmtPct(s.avg_edge)}`;
+  document.getElementById('stat-winrate').textContent = s.total_trades ? fmtPct(s.win_rate) : '—';
+  document.getElementById('stat-winrate-sub').textContent = `${s.wins}W / ${s.losses}L`;
+  document.getElementById('stat-total').textContent = s.total_trades ?? 0;
+  document.getElementById('stat-total-sub').textContent = `Best ${fmtUsdSigned(s.best_trade)} · Worst ${fmtUsdSigned(s.worst_trade)}`;
+
+  const strategies = s.strategies || {};
+  const order = ['weather', 'ai_debate', 'compounder'];
+  const labels = { weather: 'Weather', ai_debate: 'AI Debate', compounder: 'Compounder' };
+  const extras = Object.keys(strategies).filter(k => !order.includes(k));
+  const host = document.getElementById('strategy-breakdown');
+  host.innerHTML = '';
+  [...order, ...extras].forEach(k => {
+    const b = strategies[k] || { count: 0, pnl: 0 };
+    const row = document.createElement('div');
+    row.className = 'flex items-center justify-between';
+    row.innerHTML = `
+      <div>
+        <div class="font-medium">${labels[k] || k}</div>
+        <div class="text-xs muted">${b.count} trade${b.count === 1 ? '' : 's'}</div>
+      </div>
+      <div class="mono font-semibold ${pnlClass(b.pnl)}">${fmtUsdSigned(b.pnl)}</div>`;
+    host.appendChild(row);
+  });
+}
+
+function renderPositions(positions) {
+  const open = positions.filter(p => p.status === 'open');
+  const closed = positions.filter(p => p.status !== 'open').slice(0, 50);
+  document.getElementById('open-count-lbl').textContent = `${open.length} open`;
+
+  const openBody = document.getElementById('open-positions-body');
+  if (!open.length) {
+    openBody.innerHTML = '<tr><td colspan="9" class="muted text-center py-8">No open positions</td></tr>';
+  } else {
+    openBody.innerHTML = open.map(p => `
+      <tr>
+        <td class="mono">${p.ticker}</td>
+        <td>${sidePill(p.side)}</td>
+        <td class="mono text-right">${fmtCents(p.entry_price)}</td>
+        <td class="mono text-right">${fmtCents(p.current_price)}</td>
+        <td class="mono text-right">${p.contracts ?? 0}</td>
+        <td class="mono text-right ${pnlClass(p.pnl)}">${fmtUsdSigned(p.pnl || 0)}</td>
+        <td class="muted">${p.strategy || '—'}</td>
+        <td class="muted">${relTime(p.entry_time)}</td>
+        <td><span class="pill pill-hold">OPEN</span></td>
+      </tr>`).join('');
+  }
+
+  const closedBody = document.getElementById('closed-positions-body');
+  if (!closed.length) {
+    closedBody.innerHTML = '<tr><td colspan="9" class="muted text-center py-8">No closed trades yet</td></tr>';
+  } else {
+    closedBody.innerHTML = closed.map(p => {
+      const st = p.status === 'closed_profit' ? 'WIN' : p.status === 'closed_loss' ? 'LOSS' : p.status === 'settled' ? 'SETTLED' : p.status;
+      const cls = p.status === 'closed_profit' ? 'pill-yes' : p.status === 'closed_loss' ? 'pill-no' : 'pill-hold';
+      return `
+      <tr>
+        <td class="mono">${p.ticker}</td>
+        <td>${sidePill(p.side)}</td>
+        <td class="mono text-right">${fmtCents(p.entry_price)}</td>
+        <td class="mono text-right">${fmtCents(p.current_price)}</td>
+        <td class="mono text-right">${p.contracts ?? 0}</td>
+        <td class="mono text-right ${pnlClass(p.pnl)}">${fmtUsdSigned(p.pnl || 0)}</td>
+        <td class="muted">${p.strategy || '—'}</td>
+        <td class="muted">${p.exit_reason || '—'}</td>
+        <td class="muted">${relTime(p.exit_time || p.entry_time)} <span class="pill ${cls} ml-2">${st}</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  renderPnlChart(closed);
+}
+
+function renderDebates(rows) {
+  const body = document.getElementById('debate-body');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="9" class="muted text-center py-8">No debates logged yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(d => {
+    const decision = d.should_trade ? '<span class="pill pill-yes">TRADE</span>' : '<span class="pill pill-hold">SKIP</span>';
+    return `
+    <tr>
+      <td class="mono">${d.ticker}</td>
+      <td class="mono text-right">${fmtPct(d.bull_prob)}</td>
+      <td class="mono text-right">${fmtPct(d.bear_prob)}</td>
+      <td class="mono text-right">${fmtPct(d.judge_prob)}</td>
+      <td class="mono text-right">${fmtCents(d.market_price)}</td>
+      <td class="mono text-right ${pnlClass(d.edge)}">${fmtPct(d.edge)}</td>
+      <td>${sidePill(d.side)}</td>
+      <td>${decision}</td>
+      <td class="muted">${relTime(d.created_at)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderPnlChart(closed) {
+  const chrono = [...closed].reverse();
+  const labels = chrono.map((_, i) => i + 1);
+  let cum = 0;
+  const data = chrono.map(p => { cum += Number(p.pnl) || 0; return cum; });
+
+  const ctx = document.getElementById('pnlChart').getContext('2d');
+  const endColor = data.length && data[data.length - 1] >= 0 ? '#10b981' : '#ef4444';
+  const grad = ctx.createLinearGradient(0, 0, 0, 260);
+  grad.addColorStop(0, endColor + '55');
+  grad.addColorStop(1, endColor + '00');
+
+  if (pnlChart) pnlChart.destroy();
+  pnlChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{
+      label: 'Cumulative P&L',
+      data, borderColor: endColor, backgroundColor: grad,
+      fill: true, tension: 0.25, pointRadius: 0, borderWidth: 2,
+    }]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => 'P&L: ' + fmtUsdSigned(c.parsed.y) } } },
+      scales: {
+        x: { grid: { color: '#1f2330' }, ticks: { color: '#8b93a7' } },
+        y: { grid: { color: '#1f2330' }, ticks: { color: '#8b93a7', callback: v => fmtUsdSigned(v) } },
+      },
+    },
+  });
+}
+
+async function refresh() {
+  try {
+    const [status, stats, positions, debates] = await Promise.all([
+      getJSON('/api/status'),
+      getJSON('/api/stats'),
+      getJSON('/api/positions'),
+      getJSON('/api/debate_logs'),
+    ]);
+    renderStatus(status);
+    renderStats(stats);
+    renderPositions(positions);
+    renderDebates(debates);
+  } catch (e) {
+    console.error('refresh failed', e);
+    document.getElementById('hdr-sync').textContent = 'error';
+  }
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
