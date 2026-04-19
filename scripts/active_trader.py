@@ -66,6 +66,14 @@ from strategies.safe_compounder import (
     compute_compounder_size,
 )
 from strategies.ai_debate import scan_with_debate, DebateResult
+from monitoring.telegram_bot import (
+    alert_startup,
+    alert_new_position,
+    alert_exit,
+    alert_scan_summary,
+    alert_error,
+)
+from config.settings import settings as _settings
 
 console = Console(width=140)
 
@@ -289,7 +297,7 @@ def _compounder_signals(client, all_markets: list[dict]) -> list[dict]:
 # Main scan — feeds every signal through RiskEngine
 # ----------------------------------------------------------------------
 
-def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: Decimal) -> list[dict]:
+def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: Decimal) -> dict:
     risk = RiskEngine(balance)
 
     # 1. Targeted fetch — one API call per series
@@ -297,6 +305,8 @@ def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: 
     weather_markets = series_markets.get("KXHIGHNY", [])
     mlb_total = series_markets.get("KXMLBTOTAL", [])
     mlb_spread = series_markets.get("KXMLBSPREAD", [])
+
+    num_markets = len(weather_markets) + len(mlb_total) + len(mlb_spread)
 
     console.print(
         f"[dim]  Targeted: weather={len(weather_markets)} "
@@ -310,6 +320,8 @@ def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: 
     # AI debate runs on MLB markets (no domain data → LLM-driven edge)
     mlb_markets = mlb_total + mlb_spread
     debate_sigs = _debate_signals(client, mlb_markets)
+
+    num_signals = len(weather_sigs) + len(compounder_sigs) + len(debate_sigs)
 
     console.print(
         f"[dim]  Signals: weather={len(weather_sigs)}  "
@@ -336,17 +348,23 @@ def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: 
         entry = _record_entry(
             pm, sig.ticker, sig.side, sig.cost_per_contract,
             decision.approved_contracts, sig.strategy, dry_run,
+            edge=sig.edge,
         )
         if entry:
             entries.append(entry)
             existing.add(sig.ticker)
 
-    return entries
+    return {
+        "entries": entries,
+        "num_markets": num_markets,
+        "num_signals": num_signals,
+    }
 
 
 def _record_entry(
     pm: PositionManager, ticker: str, side: str,
     entry_price: Decimal, contracts: int, strategy: str, dry_run: bool,
+    edge: Decimal = Decimal("0"),
 ) -> dict | None:
     session = get_session()
     try:
@@ -367,6 +385,10 @@ def _record_entry(
             f"  [green]{'[DRY] ' if dry_run else ''}NEW[/] {ticker}  "
             f"{side.upper()} x{contracts} @ ${entry_price:.2f}  "
             f"cost=${cost:.2f}  strategy={strategy}"
+        )
+        alert_new_position(
+            ticker=ticker, side=side, contracts=contracts,
+            entry_price=entry_price, cost=cost, strategy=strategy, edge=edge,
         )
         return {
             "ticker": ticker, "side": side, "entry_price": entry_price,
@@ -467,59 +489,79 @@ def main():
     console.print(f"[dim]Balance: ${balance:,.2f}  |  Risk-gated via RiskEngine (blueprint v2)[/]")
     console.print()
 
+    alert_startup(env=_settings.kalshi_env + (" (dry-run)" if dry_run else " (live)"), balance=balance)
+
     global _running
     start_time = time.time()
     cycle = 0
     last_scan = 0.0
     last_price = 0.0
 
-    while _running:
-        now = time.time()
-        cycle += 1
+    try:
+        while _running:
+            now = time.time()
+            cycle += 1
 
-        if args.duration > 0 and (now - start_time) >= args.duration:
-            console.print(f"\n[yellow]Duration limit ({args.duration}s) reached. Stopping.[/]")
-            break
+            if args.duration > 0 and (now - start_time) >= args.duration:
+                console.print(f"\n[yellow]Duration limit ({args.duration}s) reached. Stopping.[/]")
+                break
 
-        # --- Scan for new opportunities ---
-        if now - last_scan >= SCAN_INTERVAL or last_scan == 0:
-            console.print(f"\n[bold cyan]--- Scan #{cycle} @ {datetime.now().strftime('%H:%M:%S')} ---[/]")
-            try:
-                new_entries = scan_for_opportunities(data_client, pm, dry_run, balance)
-                if new_entries:
-                    console.print(f"  [green]Entered {len(new_entries)} new position(s)[/]")
-                else:
-                    console.print(f"  [dim]No new opportunities found[/]")
-            except Exception as e:
-                console.print(f"  [red]Scan error: {e}[/]")
-            last_scan = now
-            pm.load_open_positions()
+            # --- Scan for new opportunities ---
+            if now - last_scan >= SCAN_INTERVAL or last_scan == 0:
+                console.print(f"\n[bold cyan]--- Scan #{cycle} @ {datetime.now().strftime('%H:%M:%S')} ---[/]")
+                scan_stats = {"entries": [], "num_markets": 0, "num_signals": 0}
+                try:
+                    scan_stats = scan_for_opportunities(data_client, pm, dry_run, balance)
+                    new_entries = scan_stats["entries"]
+                    if new_entries:
+                        console.print(f"  [green]Entered {len(new_entries)} new position(s)[/]")
+                    else:
+                        console.print(f"  [dim]No new opportunities found[/]")
+                except Exception as e:
+                    console.print(f"  [red]Scan error: {e}[/]")
+                    alert_error(f"Scan error: {e}")
+                last_scan = now
+                pm.load_open_positions()
+                alert_scan_summary(
+                    num_markets=scan_stats["num_markets"],
+                    num_signals=scan_stats["num_signals"],
+                    num_trades=len(scan_stats["entries"]),
+                    balance=balance,
+                )
 
-        # --- Price updates + exit evaluation ---
-        if now - last_price >= PRICE_INTERVAL or last_price == 0:
-            pm.update_prices()
+            # --- Price updates + exit evaluation ---
+            if now - last_price >= PRICE_INTERVAL or last_price == 0:
+                pm.update_prices()
 
-            decisions = pm.evaluate_exits()
-            for pos, action in decisions:
-                if action in (ExitAction.SELL_PROFIT, ExitAction.SELL_STOP_LOSS):
-                    pm.execute_exit(pos, action)
-                    label = "PROFIT" if action == ExitAction.SELL_PROFIT else "STOP-LOSS"
-                    pnl = (pos.current_price - pos.entry_price) * pos.contracts
-                    console.print(
-                        f"  [{'green' if action == ExitAction.SELL_PROFIT else 'red'}]"
-                        f"{'[DRY] ' if dry_run else ''}{label}[/] {pos.ticker}  "
-                        f"${pos.entry_price:.2f}→${pos.current_price:.2f}  "
-                        f"pnl=${float(pnl):+.2f}"
-                    )
+                decisions = pm.evaluate_exits()
+                for pos, action in decisions:
+                    if action in (ExitAction.SELL_PROFIT, ExitAction.SELL_STOP_LOSS):
+                        pm.execute_exit(pos, action)
+                        label = "PROFIT" if action == ExitAction.SELL_PROFIT else "STOP-LOSS"
+                        pnl = (pos.current_price - pos.entry_price) * pos.contracts
+                        console.print(
+                            f"  [{'green' if action == ExitAction.SELL_PROFIT else 'red'}]"
+                            f"{'[DRY] ' if dry_run else ''}{label}[/] {pos.ticker}  "
+                            f"${pos.entry_price:.2f}→${pos.current_price:.2f}  "
+                            f"pnl=${float(pnl):+.2f}"
+                        )
+                        alert_exit(
+                            ticker=pos.ticker, side=pos.side,
+                            exit_price=pos.current_price, pnl=pnl, reason=label,
+                        )
 
-            last_price = now
+                last_price = now
 
-        console.print(build_status_table(pm, cycle, mode))
+            console.print(build_status_table(pm, cycle, mode))
 
-        # Sleep, checking _running frequently for responsiveness
-        sleep_until = now + PRICE_INTERVAL
-        while _running and time.time() < sleep_until:
-            time.sleep(1)
+            # Sleep, checking _running frequently for responsiveness
+            sleep_until = now + PRICE_INTERVAL
+            while _running and time.time() < sleep_until:
+                time.sleep(1)
+    except Exception as e:
+        console.print(f"[red]Fatal error: {e}[/]")
+        alert_error(f"Fatal error: {e}")
+        raise
 
     console.print("\n[bold yellow]Active trader stopped.[/]")
 

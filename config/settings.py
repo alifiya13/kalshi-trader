@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_file: str = "logs/trader.log"
 
+    # --- Telegram alerts ---
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # ------------------------------------------------------------------
