@@ -98,6 +98,26 @@ COMPOUNDER_PREFIX_FALLBACK: tuple[str, ...] = (
 SCAN_INTERVAL = 300   # 5 minutes between opportunity scans
 PRICE_INTERVAL = 30   # 30 seconds between price updates
 
+# --- AI debate throttle ---
+# Debate calls LLMs (paid); weather + compounder are free, so only debate
+# is rate-limited. Everything else in the scan still runs every SCAN_INTERVAL.
+DEBATE_INTERVAL = 1800       # 30 min between AI debate rounds
+DEBATE_MAX_MARKETS = 3       # markets debated per round (was 5)
+DEBATE_DAILY_COST_CAP = 1.00  # USD — skip debate for the rest of the day past this
+
+_debate_last_run: float = 0.0        # monotonic-ish timestamp of last debate
+_debate_cost_day: str = ""           # UTC date str for the current cost window
+_debate_cost_today: float = 0.0      # USD spent on debates in _debate_cost_day
+
+
+def _reset_debate_budget_if_new_day() -> None:
+    """Rollover the daily cost counter at UTC midnight."""
+    global _debate_cost_day, _debate_cost_today
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today != _debate_cost_day:
+        _debate_cost_day = today
+        _debate_cost_today = 0.0
+
 # --- Graceful shutdown ---
 _running = True
 
@@ -224,15 +244,25 @@ def _log_debate_result(res: DebateResult) -> None:
 
 def _debate_signals(client, mlb_markets: list[dict]) -> list[dict]:
     """
-    Run AI debate on top 5 MLB markets by orderbook depth. Every debate
-    result (tradeable or not) is written to debate_logs. Only tradeable
-    results with a concrete side return as TradeSignals.
+    Run AI debate on top DEBATE_MAX_MARKETS MLB markets by orderbook depth.
+    Every debate result (tradeable or not) is written to debate_logs. Only
+    tradeable results with a concrete side return as TradeSignals.
+
+    Caller is responsible for cadence + budget gating (see scan_for_opportunities).
     """
+    global _debate_cost_today
     try:
-        results = scan_with_debate(client, mlb_markets)
+        results = scan_with_debate(client, mlb_markets, max_debates=DEBATE_MAX_MARKETS)
     except Exception as e:
         console.print(f"[yellow]  AI debate error: {e}[/]")
         return []
+
+    round_cost = sum(float(getattr(r, "total_cost_usd", 0.0) or 0.0) for r in results)
+    _debate_cost_today += round_cost
+    console.print(
+        f"[dim]  Debate cost: round=${round_cost:.4f}  "
+        f"today=${_debate_cost_today:.4f} / ${DEBATE_DAILY_COST_CAP:.2f}[/]"
+    )
 
     out: list[dict] = []
     for res in results:
@@ -317,9 +347,25 @@ def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: 
     weather_sigs = _weather_signals(client, weather_markets)
     all_series_markets = weather_markets + mlb_total + mlb_spread
     compounder_sigs = _compounder_signals(client, all_series_markets)
-    # AI debate runs on MLB markets (no domain data → LLM-driven edge)
+
+    # AI debate is LLM-paid — gate on interval + daily budget.
+    global _debate_last_run
+    _reset_debate_budget_if_new_day()
     mlb_markets = mlb_total + mlb_spread
-    debate_sigs = _debate_signals(client, mlb_markets)
+    now_ts = time.time()
+    if _debate_cost_today >= DEBATE_DAILY_COST_CAP:
+        console.print(
+            f"[yellow]  Debate skipped: daily cap hit "
+            f"(${_debate_cost_today:.4f} ≥ ${DEBATE_DAILY_COST_CAP:.2f})[/]"
+        )
+        debate_sigs: list[dict] = []
+    elif _debate_last_run and (now_ts - _debate_last_run) < DEBATE_INTERVAL:
+        wait_min = (DEBATE_INTERVAL - (now_ts - _debate_last_run)) / 60
+        console.print(f"[dim]  Debate skipped: next in {wait_min:.1f} min[/]")
+        debate_sigs = []
+    else:
+        debate_sigs = _debate_signals(client, mlb_markets)
+        _debate_last_run = now_ts
 
     num_signals = len(weather_sigs) + len(compounder_sigs) + len(debate_sigs)
 
