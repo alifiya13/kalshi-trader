@@ -60,6 +60,21 @@ NEAR_CERTAIN_YES = Decimal("0.97")
 NEAR_CERTAIN_NO = Decimal("0.03")
 
 
+def _is_weather(strategy: str | None) -> bool:
+    """
+    Weather positions skip stop-loss entirely.
+
+    Post-hoc analysis showed the stop-loss accounted for 100% of realized
+    losses: weather markets settle within ~24h, so an intraday dip that
+    trips the stop just locks in a loss on a position that usually recovers
+    by settlement. For weather we hold to settlement instead. Stop-loss
+    remains active for every other (future, non-weather) strategy.
+
+    Matches "weather", "weather_v1", etc.
+    """
+    return (strategy or "").startswith("weather")
+
+
 class PositionManager:
     """
     Loads open positions from DB, updates live prices, evaluates exit
@@ -185,8 +200,10 @@ class PositionManager:
                 decisions.append((pos, ExitAction.SELL_PROFIT))
                 continue
 
-            # Rule 4: Stop loss hit
-            if price_change <= -STOP_LOSS:
+            # Rule 4: Stop loss hit — DISABLED for weather (hold to settlement).
+            # Weather markets settle in ~24h and the stop-loss historically
+            # caused 100% of our realized losses, so we let them ride.
+            if not _is_weather(pos.strategy) and price_change <= -STOP_LOSS:
                 decisions.append((pos, ExitAction.SELL_STOP_LOSS))
                 continue
 

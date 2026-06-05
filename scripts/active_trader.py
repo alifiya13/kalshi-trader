@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
 =============================================================
-  ACTIVE TRADER — Continuous trading engine
+  ACTIVE TRADER — Continuous trading engine (weather-only)
 =============================================================
 
 Runs continuously:
-  - Every 5 minutes: scan for new opportunities
+  - Every 5 minutes: scan for new weather opportunities
   - Every 30 seconds: update prices + evaluate exits
   - Prints live status table to terminal
 
-Scanning is TARGETED: we hit specific series directly via
-`get_markets(series_ticker=...)` instead of paginating through
+Scanning is TARGETED: we hit the KXHIGHNY weather series directly
+via `get_markets(series_ticker=...)` instead of paginating through
 the entire prod catalog (which is dominated by zero-volume
 parlay permutations).
 
-Every entry candidate — from every strategy — is gated by the
-single RiskEngine (execution/risk_engine.py). No strategy does
-its own sizing.
+Every entry candidate is gated by the single RiskEngine
+(execution/risk_engine.py). No strategy does its own sizing.
 
 Ctrl+C to stop gracefully.
 
@@ -57,15 +56,9 @@ from rich.table import Table
 from rich import box
 
 from core.rest_client import get_data_client, get_trade_client
-from data.db import Position, DebateLog, get_session, init_db
-from data.market_scanner import infer_category
+from data.db import Position, get_session, init_db
 from execution.position_manager import PositionManager, ExitAction
 from execution.risk_engine import RiskEngine, TradeSignal
-from strategies.safe_compounder import (
-    find_compounder_opportunities,
-    compute_compounder_size,
-)
-from strategies.ai_debate import scan_with_debate, DebateResult
 from monitoring.telegram_bot import (
     alert_startup,
     alert_new_position,
@@ -78,45 +71,16 @@ from config.settings import settings as _settings
 console = Console(width=140)
 
 # --- Scanning targets ---
-# Series we actively pull and feed into strategies. Adding a series here
-# gives it to BOTH the weather/MLB/strategy-specific scorers (where
-# applicable) AND the Safe Compounder broad scan.
+# Weather-only. We pull this series directly and feed it into the weather
+# strategy. Every candidate still passes the single RiskEngine gate.
 TARGETED_SERIES: tuple[str, ...] = (
     "KXHIGHNY",       # NYC daily high — weather_v1 strategy
-    "KXMLBTOTAL",     # MLB game totals (over/under)
-    "KXMLBSPREAD",    # MLB game spreads (run line)
-)
-
-# Optional: prefixes to sweep into the compounder when the series filter
-# above misses things. Kalshi's series_ticker mapping isn't always 1:1
-# with ticker prefix, so we keep a fallback list.
-COMPOUNDER_PREFIX_FALLBACK: tuple[str, ...] = (
-    "KXMLBTOTAL", "KXMLBSPREAD",
 )
 
 # Loop cadence
 SCAN_INTERVAL = 300   # 5 minutes between opportunity scans
 PRICE_INTERVAL = 30   # 30 seconds between price updates
 
-# --- AI debate throttle ---
-# Debate calls LLMs (paid); weather + compounder are free, so only debate
-# is rate-limited. Everything else in the scan still runs every SCAN_INTERVAL.
-DEBATE_INTERVAL = 1800       # 30 min between AI debate rounds
-DEBATE_MAX_MARKETS = 3       # markets debated per round (was 5)
-DEBATE_DAILY_COST_CAP = 1.00  # USD — skip debate for the rest of the day past this
-
-_debate_last_run: float = 0.0        # monotonic-ish timestamp of last debate
-_debate_cost_day: str = ""           # UTC date str for the current cost window
-_debate_cost_today: float = 0.0      # USD spent on debates in _debate_cost_day
-
-
-def _reset_debate_budget_if_new_day() -> None:
-    """Rollover the daily cost counter at UTC midnight."""
-    global _debate_cost_day, _debate_cost_today
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if today != _debate_cost_day:
-        _debate_cost_day = today
-        _debate_cost_today = 0.0
 
 # --- Graceful shutdown ---
 _running = True
@@ -140,8 +104,8 @@ def _fetch_series_markets(client, series_ticker: str) -> list[dict]:
     try:
         resp = client.get_markets(series_ticker=series_ticker, status="open", limit=200)
         markets = resp.get("markets", [])
-        # Paginate if there's a cursor (shouldn't happen often for a single series,
-        # but some have enough strikes to exceed 200 — e.g., MLB on a full slate day).
+        # Paginate if there's a cursor (rare for a single series, but some have
+        # enough strikes to exceed 200).
         cursor = resp.get("cursor")
         while cursor:
             resp = client.get_markets(
@@ -155,18 +119,8 @@ def _fetch_series_markets(client, series_ticker: str) -> list[dict]:
         return []
 
 
-def _fetch_targeted_markets(client) -> dict[str, list[dict]]:
-    """Return {series_ticker: [markets]} for every series in TARGETED_SERIES."""
-    out: dict[str, list[dict]] = {}
-    for s in TARGETED_SERIES:
-        markets = _fetch_series_markets(client, s)
-        out[s] = markets
-        console.print(f"[dim]  {s}: {len(markets)} market(s)[/]")
-    return out
-
-
 # ----------------------------------------------------------------------
-# Strategy scanners — each returns a list of TradeSignal + extra context
+# Weather scanner — returns a list of TradeSignal + extra context
 # ----------------------------------------------------------------------
 
 def _weather_signals(client, weather_markets: list[dict]) -> list[dict]:
@@ -215,114 +169,6 @@ def _weather_signals(client, weather_markets: list[dict]) -> list[dict]:
     return out
 
 
-def _log_debate_result(res: DebateResult) -> None:
-    """Persist every debate to DB for later calibration (regardless of trade)."""
-    session = get_session()
-    try:
-        session.add(DebateLog(
-            ticker=res.ticker,
-            market_title=res.market_title,
-            bull_prob=Decimal(str(res.bull_prob)),
-            bear_prob=Decimal(str(res.bear_prob)),
-            judge_prob=Decimal(str(res.judge_prob)),
-            disagreement=Decimal(str(res.disagreement)),
-            market_price=res.market_price,
-            edge=res.edge,
-            side=res.side,
-            confidence=res.confidence,
-            should_trade=1 if res.should_trade else 0,
-            total_cost=Decimal(str(res.total_cost_usd)),
-            created_at=datetime.now(timezone.utc),
-        ))
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        console.print(f"[yellow]  Failed to log debate for {res.ticker}: {e}[/]")
-    finally:
-        session.close()
-
-
-def _debate_signals(client, mlb_markets: list[dict]) -> list[dict]:
-    """
-    Run AI debate on top DEBATE_MAX_MARKETS MLB markets by orderbook depth.
-    Every debate result (tradeable or not) is written to debate_logs. Only
-    tradeable results with a concrete side return as TradeSignals.
-
-    Caller is responsible for cadence + budget gating (see scan_for_opportunities).
-    """
-    global _debate_cost_today
-    try:
-        results = scan_with_debate(client, mlb_markets, max_debates=DEBATE_MAX_MARKETS)
-    except Exception as e:
-        console.print(f"[yellow]  AI debate error: {e}[/]")
-        return []
-
-    round_cost = sum(float(getattr(r, "total_cost_usd", 0.0) or 0.0) for r in results)
-    _debate_cost_today += round_cost
-    console.print(
-        f"[dim]  Debate cost: round=${round_cost:.4f}  "
-        f"today=${_debate_cost_today:.4f} / ${DEBATE_DAILY_COST_CAP:.2f}[/]"
-    )
-
-    out: list[dict] = []
-    for res in results:
-        _log_debate_result(res)
-        if not res.should_trade or res.side == "hold":
-            continue
-        if res.cost_per_contract <= 0 or res.cost_per_contract >= 1:
-            continue
-        desired = 30  # engine clamps via threshold-table max_pct
-        out.append({
-            "signal": TradeSignal(
-                ticker=res.ticker,
-                side=res.side,
-                strategy="ai_debate",
-                edge=res.edge,
-                confidence=res.confidence,
-                cost_per_contract=res.cost_per_contract,
-                desired_contracts=desired,
-                category=res.category,
-            ),
-            "extra": {
-                "judge_prob": res.judge_prob,
-                "disagreement": res.disagreement,
-                "total_cost": res.total_cost_usd,
-            },
-        })
-    return out
-
-
-def _compounder_signals(client, all_markets: list[dict]) -> list[dict]:
-    """Run the safe compounder against the combined targeted market set."""
-    try:
-        comp_signals = find_compounder_opportunities(client, all_markets)
-    except Exception as e:
-        console.print(f"[yellow]  Compounder scan error: {e}[/]")
-        return []
-
-    out: list[dict] = []
-    for cs in comp_signals:
-        desired = 50  # compounder wants size; engine will clamp
-        out.append({
-            "signal": TradeSignal(
-                ticker=cs.ticker,
-                side=cs.side,
-                strategy="safe_compounder",
-                edge=cs.edge,
-                confidence=cs.confidence,
-                cost_per_contract=cs.cost_per_contract,
-                desired_contracts=desired,
-                category=cs.category,
-            ),
-            "extra": {
-                "time_decay": float(cs.time_decay_bonus),
-                "hours_to_close": cs.hours_to_close,
-                "depth": float(cs.orderbook_depth),
-            },
-        })
-    return out
-
-
 # ----------------------------------------------------------------------
 # Main scan — feeds every signal through RiskEngine
 # ----------------------------------------------------------------------
@@ -330,56 +176,20 @@ def _compounder_signals(client, all_markets: list[dict]) -> list[dict]:
 def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: Decimal) -> dict:
     risk = RiskEngine(balance)
 
-    # 1. Targeted fetch — one API call per series
-    series_markets = _fetch_targeted_markets(client)
-    weather_markets = series_markets.get("KXHIGHNY", [])
-    mlb_total = series_markets.get("KXMLBTOTAL", [])
-    mlb_spread = series_markets.get("KXMLBSPREAD", [])
+    # 1. Targeted fetch — one API call for the weather series
+    weather_markets = _fetch_series_markets(client, "KXHIGHNY")
+    num_markets = len(weather_markets)
+    console.print(f"[dim]  Targeted: weather={len(weather_markets)}[/]")
 
-    num_markets = len(weather_markets) + len(mlb_total) + len(mlb_spread)
-
-    console.print(
-        f"[dim]  Targeted: weather={len(weather_markets)} "
-        f"mlb_total={len(mlb_total)} mlb_spread={len(mlb_spread)}[/]"
-    )
-
-    # 2. Build signals from each strategy
+    # 2. Build weather signals
     weather_sigs = _weather_signals(client, weather_markets)
-    all_series_markets = weather_markets + mlb_total + mlb_spread
-    compounder_sigs = _compounder_signals(client, all_series_markets)
-
-    # AI debate is LLM-paid — gate on interval + daily budget.
-    global _debate_last_run
-    _reset_debate_budget_if_new_day()
-    mlb_markets = mlb_total + mlb_spread
-    now_ts = time.time()
-    if _debate_cost_today >= DEBATE_DAILY_COST_CAP:
-        console.print(
-            f"[yellow]  Debate skipped: daily cap hit "
-            f"(${_debate_cost_today:.4f} ≥ ${DEBATE_DAILY_COST_CAP:.2f})[/]"
-        )
-        debate_sigs: list[dict] = []
-    elif _debate_last_run and (now_ts - _debate_last_run) < DEBATE_INTERVAL:
-        wait_min = (DEBATE_INTERVAL - (now_ts - _debate_last_run)) / 60
-        console.print(f"[dim]  Debate skipped: next in {wait_min:.1f} min[/]")
-        debate_sigs = []
-    else:
-        debate_sigs = _debate_signals(client, mlb_markets)
-        _debate_last_run = now_ts
-
-    num_signals = len(weather_sigs) + len(compounder_sigs) + len(debate_sigs)
-
-    console.print(
-        f"[dim]  Signals: weather={len(weather_sigs)}  "
-        f"compounder={len(compounder_sigs)}  debate={len(debate_sigs)}[/]"
-    )
+    num_signals = len(weather_sigs)
+    console.print(f"[dim]  Signals: weather={len(weather_sigs)}[/]")
 
     # 3. Gate each signal via RiskEngine
     existing = {p.ticker for p in pm.positions if p.status == "open"}
     entries: list[dict] = []
-    # Priority order: weather (hardest domain signal), debate (AI-synthesized),
-    # compounder (mechanical baseline). Each still passes the same gate.
-    for bundle in weather_sigs + debate_sigs + compounder_sigs:
+    for bundle in weather_sigs:
         sig: TradeSignal = bundle["signal"]
         if sig.ticker in existing:
             continue
