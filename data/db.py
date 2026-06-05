@@ -186,10 +186,13 @@ class CouncilDecision(Base):
 
     # --- Stage 1: independent analysis (positional A/B/C) ---
     stage1_model_a_prob = Column(Numeric)
+    stage1_model_a_side = Column(String)
     stage1_model_a_reasoning = Column(Text)
     stage1_model_b_prob = Column(Numeric)
+    stage1_model_b_side = Column(String)
     stage1_model_b_reasoning = Column(Text)
     stage1_model_c_prob = Column(Numeric)
+    stage1_model_c_side = Column(String)
     stage1_model_c_reasoning = Column(Text)
 
     # --- Stage 2: peer review (updated probabilities) ---
@@ -206,6 +209,8 @@ class CouncilDecision(Base):
     stage3_should_trade = Column(Integer)   # 0/1 (no native bool on SQLite)
     stage3_side = Column(String)            # "yes" | "no"
     stage3_reasoning = Column(Text)
+    stage3_dissent_summary = Column(Text)
+    stage3_risk_factors = Column(Text)
 
     # --- Market snapshot + edge at decision time ---
     market_yes_price = Column(Numeric)

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Kalshi Trader</title>
+<title>Council Monitor</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
@@ -11,7 +11,6 @@
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Inter", "Segoe UI", sans-serif; }
   .card { background: #161922; border: 1px solid #1f2330; border-radius: 12px; }
   .muted { color: #8b93a7; }
-  .divide-row > * + * { border-top: 1px solid #1f2330; }
   table { border-collapse: separate; border-spacing: 0; width: 100%; }
   th, td { padding: 10px 12px; font-size: 13px; }
   thead th { text-align: left; font-weight: 600; color: #8b93a7; text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; background: #12151c; position: sticky; top: 0; }
@@ -19,7 +18,7 @@
   .mono { font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace; }
   .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 10px #10b981; animation: pulse 1.4s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-  .scroll-h { max-height: 440px; overflow: auto; }
+  .scroll-h { max-height: 520px; overflow: auto; }
   .scroll-h::-webkit-scrollbar { width: 8px; height: 8px; }
   .scroll-h::-webkit-scrollbar-thumb { background: #2a2f3d; border-radius: 4px; }
   .badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
@@ -29,6 +28,11 @@
   .pill-no { background: rgba(244, 63, 94, 0.15); color: #fb7185; }
   .pill-hold { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; }
   .pill { padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .clip3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .council-row { cursor: pointer; }
+  .council-row:hover td { background: #1a1e29; }
+  .row-open td { background: #1a1e29; }
+  .stage-card { background: #12151c; border: 1px solid #1f2330; border-radius: 10px; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -38,7 +42,10 @@
   <div class="max-w-7xl mx-auto px-4 md:px-6 py-3 flex items-center justify-between gap-4 flex-wrap">
     <div class="flex items-center gap-3">
       <div class="pulse-dot"></div>
-      <span class="text-lg md:text-xl font-bold tracking-wide">KALSHI<span class="text-emerald-400"> TRADER</span></span>
+      <div class="flex flex-col leading-tight">
+        <span class="text-lg md:text-xl font-bold tracking-wide">COUNCIL<span class="text-emerald-400"> MONITOR</span></span>
+        <span class="muted text-[11px] tracking-wide">Weather Market Decisions</span>
+      </div>
       <span id="env-badge" class="badge badge-demo">demo</span>
     </div>
     <div class="flex items-center gap-4 md:gap-6 text-sm">
@@ -63,24 +70,24 @@
   <!-- Stat cards -->
   <section class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
     <div class="card p-4">
-      <div class="muted text-xs uppercase tracking-wider">Total P&amp;L</div>
+      <div class="muted text-xs uppercase tracking-wider">Paper P&amp;L</div>
       <div id="stat-pnl" class="text-2xl md:text-3xl mono font-bold mt-1">$0.00</div>
-      <div id="stat-pnl-sub" class="text-xs muted mt-1">Realized · all strategies</div>
+      <div id="stat-pnl-sub" class="text-xs muted mt-1">Realized · weather_council</div>
     </div>
     <div class="card p-4">
       <div class="muted text-xs uppercase tracking-wider">Win Rate</div>
       <div id="stat-winrate" class="text-2xl md:text-3xl mono font-bold mt-1">—</div>
-      <div id="stat-winrate-sub" class="text-xs muted mt-1">0W / 0L</div>
+      <div id="stat-winrate-sub" class="text-xs muted mt-1">0W / 0L settled</div>
     </div>
     <div class="card p-4">
       <div class="muted text-xs uppercase tracking-wider">Open Positions</div>
       <div id="stat-open" class="text-2xl md:text-3xl mono font-bold mt-1">0</div>
-      <div id="stat-open-sub" class="text-xs muted mt-1">Currently live</div>
+      <div id="stat-open-sub" class="text-xs muted mt-1">Paper · currently live</div>
     </div>
     <div class="card p-4">
-      <div class="muted text-xs uppercase tracking-wider">Total Trades</div>
+      <div class="muted text-xs uppercase tracking-wider">Council Decisions</div>
       <div id="stat-total" class="text-2xl md:text-3xl mono font-bold mt-1">0</div>
-      <div id="stat-total-sub" class="text-xs muted mt-1">Best —  ·  Worst —</div>
+      <div id="stat-total-sub" class="text-xs muted mt-1">TRADE — · SKIP —</div>
     </div>
   </section>
 
@@ -89,7 +96,7 @@
     <div class="card p-4 lg:col-span-2">
       <div class="flex items-center justify-between mb-3">
         <h2 class="font-semibold">Cumulative P&amp;L</h2>
-        <span class="text-xs muted">Closed trades, most-recent-first</span>
+        <span class="text-xs muted">Settled paper trades, chronological</span>
       </div>
       <div class="h-64 md:h-72"><canvas id="pnlChart"></canvas></div>
     </div>
@@ -99,6 +106,60 @@
         <span class="text-xs muted">Realized</span>
       </div>
       <div id="strategy-breakdown" class="space-y-3"></div>
+    </div>
+  </section>
+
+  <!-- Council Accuracy -->
+  <section class="card p-4">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-semibold">Council Accuracy</h2>
+      <span class="text-xs muted">Is the council's call correct once markets settle?</span>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3 md:gap-4">
+      <div class="stage-card p-3">
+        <div class="muted text-[11px] uppercase tracking-wider">Decisions</div>
+        <div id="acc-total" class="text-xl mono font-bold mt-1">0</div>
+        <div id="acc-tradeskip" class="text-xs muted mt-1">TRADE — · SKIP —</div>
+      </div>
+      <div class="stage-card p-3">
+        <div class="muted text-[11px] uppercase tracking-wider">Settled</div>
+        <div id="acc-settled" class="text-xl mono font-bold mt-1">0</div>
+        <div class="text-xs muted mt-1">markets resolved</div>
+      </div>
+      <div class="stage-card p-3">
+        <div class="muted text-[11px] uppercase tracking-wider">Council Accuracy</div>
+        <div id="acc-accuracy" class="text-xl mono font-bold mt-1">—</div>
+        <div id="acc-correct" class="text-xs muted mt-1">— correct</div>
+      </div>
+      <div class="stage-card p-3">
+        <div class="muted text-[11px] uppercase tracking-wider">Avg Conf · Wins</div>
+        <div id="acc-conf-win" class="text-xl mono font-bold mt-1 text-emerald-400">—</div>
+        <div class="text-xs muted mt-1">on correct calls</div>
+      </div>
+      <div class="stage-card p-3">
+        <div class="muted text-[11px] uppercase tracking-wider">Avg Conf · Losses</div>
+        <div id="acc-conf-lose" class="text-xl mono font-bold mt-1 text-rose-400">—</div>
+        <div class="text-xs muted mt-1">on wrong calls</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Council decisions -->
+  <section class="card">
+    <div class="flex items-center justify-between p-4 border-b border-[#1f2330]">
+      <h2 class="font-semibold">Council Decisions</h2>
+      <span class="text-xs muted">Latest 50 · click a row for full reasoning</span>
+    </div>
+    <div class="scroll-h">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Date</th><th class="text-right">NWS</th><th class="text-right">Mkt YES</th>
+            <th class="text-right">Final P</th><th class="text-right">Edge</th><th>Decision</th><th>When</th>
+          </tr>
+        </thead>
+        <tbody id="council-body"><tr><td colspan="8" class="muted text-center py-8">No council decisions yet</td></tr></tbody>
+      </table>
     </div>
   </section>
 
@@ -140,32 +201,14 @@
     </div>
   </section>
 
-  <!-- Debate log -->
-  <section class="card">
-    <div class="flex items-center justify-between p-4 border-b border-[#1f2330]">
-      <h2 class="font-semibold">AI Debate Log</h2>
-      <span class="text-xs muted">Last 50 debates</span>
-    </div>
-    <div class="scroll-h">
-      <table>
-        <thead>
-          <tr>
-            <th>Ticker</th><th class="text-right">Bull</th><th class="text-right">Bear</th>
-            <th class="text-right">Judge</th><th class="text-right">Mkt</th><th class="text-right">Edge</th>
-            <th>Side</th><th>Decision</th><th>When</th>
-          </tr>
-        </thead>
-        <tbody id="debate-body"><tr><td colspan="9" class="muted text-center py-8">No debates logged yet</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <footer class="text-xs muted text-center py-6">Auto-refresh every 10s · read-only view of the trader DB</footer>
+  <footer class="text-xs muted text-center py-6">Auto-refresh every 10s · read-only research view · paper trading only</footer>
 </main>
 
 <script>
 const REFRESH_MS = 10000;
 let pnlChart = null;
+let openDetailId = null;          // which council decision is expanded
+const detailCache = {};            // id -> detail JSON
 
 const fmtUsd = (v) => {
   if (v === null || v === undefined || isNaN(v)) return '—';
@@ -176,6 +219,7 @@ const fmtUsdSigned = (v) => (v >= 0 ? '+' : '') + fmtUsd(v);
 const fmtPct = (v) => (v === null || v === undefined || isNaN(v)) ? '—' : (Number(v) * 100).toFixed(1) + '%';
 const fmtCents = (v) => (v === null || v === undefined || isNaN(v)) ? '—' : '$' + Number(v).toFixed(2);
 const pnlClass = (v) => (v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-slate-300');
+const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])));
 
 function fmtUptime(s) {
   if (!s && s !== 0) return '—';
@@ -200,6 +244,12 @@ function relTime(iso) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+// "KXHIGHNY-26JUN06-B91.5" -> "JUN 06"
+function tickerDate(ticker) {
+  const m = /-(\d{2})([A-Z]{3})(\d{2})-/.exec(ticker || '');
+  return m ? `${m[2]} ${m[3]}` : '—';
+}
+
 async function getJSON(url) {
   const r = await fetch(url, { cache: 'no-store' });
   if (!r.ok) throw new Error(url + ' -> ' + r.status);
@@ -211,7 +261,20 @@ function sidePill(side) {
   if (s === 'yes') return `<span class="pill pill-yes">YES</span>`;
   if (s === 'no')  return `<span class="pill pill-no">NO</span>`;
   if (s === 'hold') return `<span class="pill pill-hold">HOLD</span>`;
-  return `<span class="pill pill-hold">${s || '—'}</span>`;
+  return `<span class="pill pill-hold">${esc(s) || '—'}</span>`;
+}
+
+function decisionPill(shouldTrade) {
+  return shouldTrade
+    ? `<span class="pill pill-yes">TRADE</span>`
+    : `<span class="pill pill-hold">SKIP</span>`;
+}
+
+function correctTag(wasCorrect) {
+  if (wasCorrect === null || wasCorrect === undefined) return '';
+  return wasCorrect
+    ? `<span class="pill pill-yes ml-2">✓ CORRECT</span>`
+    : `<span class="pill pill-no ml-2">✗ WRONG</span>`;
 }
 
 function renderStatus(st) {
@@ -227,30 +290,180 @@ function renderStats(s) {
   const pnlEl = document.getElementById('stat-pnl');
   pnlEl.textContent = fmtUsdSigned(s.total_pnl);
   pnlEl.className = 'text-2xl md:text-3xl mono font-bold mt-1 ' + pnlClass(s.total_pnl);
-  document.getElementById('stat-pnl-sub').textContent = `avg edge ${fmtPct(s.avg_edge)}`;
+  document.getElementById('stat-pnl-sub').textContent = `avg council edge ${fmtPct(s.avg_edge)}`;
   document.getElementById('stat-winrate').textContent = s.total_trades ? fmtPct(s.win_rate) : '—';
-  document.getElementById('stat-winrate-sub').textContent = `${s.wins}W / ${s.losses}L`;
-  document.getElementById('stat-total').textContent = s.total_trades ?? 0;
-  document.getElementById('stat-total-sub').textContent = `Best ${fmtUsdSigned(s.best_trade)} · Worst ${fmtUsdSigned(s.worst_trade)}`;
+  document.getElementById('stat-winrate-sub').textContent = `${s.wins}W / ${s.losses}L settled`;
 
   const strategies = s.strategies || {};
-  const order = ['weather', 'ai_debate', 'compounder'];
-  const labels = { weather: 'Weather', ai_debate: 'AI Debate', compounder: 'Compounder' };
-  const extras = Object.keys(strategies).filter(k => !order.includes(k));
+  const labels = { weather_council: 'Weather Council' };
   const host = document.getElementById('strategy-breakdown');
   host.innerHTML = '';
-  [...order, ...extras].forEach(k => {
+  Object.keys(strategies).forEach(k => {
     const b = strategies[k] || { count: 0, pnl: 0 };
     const row = document.createElement('div');
     row.className = 'flex items-center justify-between';
     row.innerHTML = `
       <div>
-        <div class="font-medium">${labels[k] || k}</div>
+        <div class="font-medium">${esc(labels[k] || k)}</div>
         <div class="text-xs muted">${b.count} trade${b.count === 1 ? '' : 's'}</div>
       </div>
       <div class="mono font-semibold ${pnlClass(b.pnl)}">${fmtUsdSigned(b.pnl)}</div>`;
     host.appendChild(row);
   });
+  if (!Object.keys(strategies).length) host.innerHTML = '<div class="text-xs muted">No trades yet</div>';
+}
+
+function renderAccuracy(a) {
+  document.getElementById('acc-total').textContent = a.total_decisions ?? 0;
+  document.getElementById('acc-tradeskip').textContent = `TRADE ${a.trade ?? 0} · SKIP ${a.skip ?? 0}`;
+  document.getElementById('acc-settled').textContent = a.settled ?? 0;
+  document.getElementById('acc-accuracy').textContent = a.accuracy === null || a.accuracy === undefined ? '—' : fmtPct(a.accuracy);
+  document.getElementById('acc-correct').textContent = `${a.correct ?? 0}/${a.settled ?? 0} correct`;
+  document.getElementById('acc-conf-win').textContent = a.avg_confidence_winning === null || a.avg_confidence_winning === undefined ? '—' : fmtPct(a.avg_confidence_winning);
+  document.getElementById('acc-conf-lose').textContent = a.avg_confidence_losing === null || a.avg_confidence_losing === undefined ? '—' : fmtPct(a.avg_confidence_losing);
+  // Also reflect TRADE/SKIP in the top stat card
+  document.getElementById('stat-total').textContent = a.total_decisions ?? 0;
+  document.getElementById('stat-total-sub').textContent = `TRADE ${a.trade ?? 0} · SKIP ${a.skip ?? 0}`;
+}
+
+function renderCouncil(rows) {
+  const body = document.getElementById('council-body');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="8" class="muted text-center py-8">No council decisions yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(d => `
+    <tr class="council-row" data-id="${d.id}" onclick="toggleDecision(${d.id}, this)">
+      <td class="mono">${esc(d.ticker)}</td>
+      <td class="muted">${tickerDate(d.ticker)}</td>
+      <td class="mono text-right">${d.nws_high == null ? '—' : esc(d.nws_high) + '°F'}</td>
+      <td class="mono text-right">${fmtCents(d.market_yes_price)}</td>
+      <td class="mono text-right">${fmtPct(d.final_prob)}</td>
+      <td class="mono text-right ${pnlClass(d.edge)}">${fmtPct(d.edge)}</td>
+      <td>${decisionPill(d.should_trade)}${correctTag(d.was_correct)}</td>
+      <td class="muted">${relTime(d.created_at)}</td>
+    </tr>`).join('');
+
+  // Re-open a previously expanded row after refresh
+  if (openDetailId != null) {
+    const row = body.querySelector(`tr[data-id="${openDetailId}"]`);
+    if (row) insertDetail(openDetailId, row);
+    else openDetailId = null;
+  }
+}
+
+function stage1Card(c) {
+  return `
+    <div class="stage-card p-3">
+      <div class="flex items-center justify-between mb-1">
+        <span class="font-semibold text-sm">${esc(c.label)}</span>
+        ${sidePill(c.side)}
+      </div>
+      <div class="text-[11px] muted mono mb-2 truncate" title="${esc(c.model)}">${esc(c.model)}</div>
+      <div class="mono text-lg font-bold mb-2">P(YES) ${fmtPct(c.prob)}</div>
+      <div class="text-xs text-slate-300 clip3" title="${esc(c.reasoning)}">${esc(c.reasoning) || '<span class="muted">—</span>'}</div>
+    </div>`;
+}
+
+function stage2Card(c) {
+  return `
+    <div class="stage-card p-3">
+      <div class="flex items-center justify-between mb-1">
+        <span class="font-semibold text-sm">${esc(c.label)}</span>
+        <span class="mono text-sm">${fmtPct(c.updated_prob)}</span>
+      </div>
+      <div class="text-[11px] muted mono mb-2 truncate" title="${esc(c.model)}">${esc(c.model)}</div>
+      <div class="text-xs text-slate-300 clip3" title="${esc(c.reasoning)}">${esc(c.reasoning) || '<span class="muted">—</span>'}</div>
+    </div>`;
+}
+
+function renderDecisionDetail(d) {
+  const s3 = d.stage3 || {};
+  const traded = s3.should_trade;
+  const why = `The council decided to <b class="${traded ? 'text-emerald-400' : 'text-slate-300'}">${traded ? 'TRADE' : 'SKIP'}</b> `
+    + `(side <b>${esc((s3.side || '').toUpperCase())}</b>, final P(YES) ${fmtPct(s3.final_prob)}, confidence ${fmtPct(s3.confidence)}) `
+    + `because ${esc(s3.reasoning) || '—'}`
+    + (s3.dissent_summary ? `<div class="mt-2"><span class="text-amber-300 font-semibold">Key dissent:</span> ${esc(s3.dissent_summary)}</div>` : '');
+
+  const settled = d.market_result
+    ? `<div class="mt-2 text-xs">Settled: market resolved <b>${esc((d.market_result||'').toUpperCase())}</b> ${correctTag(d.was_correct)}</div>`
+    : '';
+
+  return `
+    <div class="p-4 space-y-4">
+      <!-- WHY summary -->
+      <div class="rounded-lg p-3 ${traded ? 'bg-emerald-500/10 border border-emerald-500/30' : 'bg-slate-500/10 border border-slate-500/20'}">
+        <div class="text-[11px] uppercase tracking-wider muted mb-1">Why this decision</div>
+        <div class="text-sm leading-relaxed">${why}</div>
+        ${settled}
+        <div class="text-[11px] muted mt-2">NWS ${d.nws_high == null ? '—' : d.nws_high + '°F'} · Mkt YES ${fmtCents(d.market_yes_price)} · edge ${fmtPct(d.edge)} · council cost ${fmtUsd(d.total_cost_usd)}</div>
+      </div>
+
+      <!-- Stage 1 -->
+      <div>
+        <div class="text-[11px] uppercase tracking-wider muted mb-2">Stage 1 · Independent Analysis</div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">${(d.stage1 || []).map(stage1Card).join('')}</div>
+      </div>
+
+      <!-- Stage 2 -->
+      <div>
+        <div class="text-[11px] uppercase tracking-wider muted mb-2">Stage 2 · Peer Review (anonymized)</div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">${(d.stage2 || []).map(stage2Card).join('')}</div>
+      </div>
+
+      <!-- Stage 3 -->
+      <div>
+        <div class="text-[11px] uppercase tracking-wider muted mb-2">Stage 3 · Chairman Synthesis</div>
+        <div class="stage-card p-4">
+          <div class="flex flex-wrap items-center gap-4 mb-3">
+            <div><span class="muted text-xs">Final P(YES)</span><div class="mono text-lg font-bold">${fmtPct(s3.final_prob)}</div></div>
+            <div><span class="muted text-xs">Confidence</span><div class="mono text-lg font-bold">${fmtPct(s3.confidence)}</div></div>
+            <div><span class="muted text-xs">Side</span><div>${sidePill(s3.side)}</div></div>
+            <div><span class="muted text-xs">Decision</span><div>${decisionPill(traded)}</div></div>
+            <div class="text-[11px] muted ml-auto mono" title="${esc(s3.model)}">${esc(s3.model)}</div>
+          </div>
+          <div class="text-sm text-slate-300 mb-3">${esc(s3.reasoning) || '<span class="muted">—</span>'}</div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div class="rounded-lg bg-amber-500/5 border border-amber-500/20 p-3">
+              <div class="text-[11px] uppercase tracking-wider text-amber-300 mb-1">Dissent summary</div>
+              <div class="text-xs text-slate-300">${esc(s3.dissent_summary) || '<span class="muted">none recorded</span>'}</div>
+            </div>
+            <div class="rounded-lg bg-rose-500/5 border border-rose-500/20 p-3">
+              <div class="text-[11px] uppercase tracking-wider text-rose-300 mb-1">Risk factors</div>
+              <div class="text-xs text-slate-300">${esc(s3.risk_factors) || '<span class="muted">none recorded</span>'}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function insertDetail(id, rowEl) {
+  const tr = document.createElement('tr');
+  tr.className = 'detail-row'; tr.id = 'detail-' + id;
+  const td = document.createElement('td');
+  td.colSpan = 8; td.className = 'p-0';
+  td.innerHTML = detailCache[id]
+    ? renderDecisionDetail(detailCache[id])
+    : '<div class="p-4 muted">Loading…</div>';
+  tr.appendChild(td);
+  rowEl.classList.add('row-open');
+  rowEl.after(tr);
+  if (!detailCache[id]) {
+    getJSON('/api/council_decision/' + id)
+      .then(d => { detailCache[id] = d; if (openDetailId === id) td.innerHTML = renderDecisionDetail(d); })
+      .catch(() => { td.innerHTML = '<div class="p-4 text-rose-400">Failed to load council detail.</div>'; });
+  }
+}
+
+function toggleDecision(id, rowEl) {
+  const existing = document.getElementById('detail-' + id);
+  // Close any open detail first
+  document.querySelectorAll('.detail-row').forEach(e => e.remove());
+  document.querySelectorAll('.row-open').forEach(e => e.classList.remove('row-open'));
+  if (existing && openDetailId === id) { openDetailId = null; return; }
+  openDetailId = id;
+  insertDetail(id, rowEl);
 }
 
 function renderPositions(positions) {
@@ -264,13 +477,13 @@ function renderPositions(positions) {
   } else {
     openBody.innerHTML = open.map(p => `
       <tr>
-        <td class="mono">${p.ticker}</td>
+        <td class="mono">${esc(p.ticker)}</td>
         <td>${sidePill(p.side)}</td>
         <td class="mono text-right">${fmtCents(p.entry_price)}</td>
         <td class="mono text-right">${fmtCents(p.current_price)}</td>
         <td class="mono text-right">${p.contracts ?? 0}</td>
         <td class="mono text-right ${pnlClass(p.pnl)}">${fmtUsdSigned(p.pnl || 0)}</td>
-        <td class="muted">${p.strategy || '—'}</td>
+        <td class="muted">${esc(p.strategy) || '—'}</td>
         <td class="muted">${relTime(p.entry_time)}</td>
         <td><span class="pill pill-hold">OPEN</span></td>
       </tr>`).join('');
@@ -285,43 +498,20 @@ function renderPositions(positions) {
       const cls = p.status === 'closed_profit' ? 'pill-yes' : p.status === 'closed_loss' ? 'pill-no' : 'pill-hold';
       return `
       <tr>
-        <td class="mono">${p.ticker}</td>
+        <td class="mono">${esc(p.ticker)}</td>
         <td>${sidePill(p.side)}</td>
         <td class="mono text-right">${fmtCents(p.entry_price)}</td>
         <td class="mono text-right">${fmtCents(p.current_price)}</td>
         <td class="mono text-right">${p.contracts ?? 0}</td>
         <td class="mono text-right ${pnlClass(p.pnl)}">${fmtUsdSigned(p.pnl || 0)}</td>
-        <td class="muted">${p.strategy || '—'}</td>
-        <td class="muted">${p.exit_reason || '—'}</td>
+        <td class="muted">${esc(p.strategy) || '—'}</td>
+        <td class="muted">${esc(p.exit_reason) || '—'}</td>
         <td class="muted">${relTime(p.exit_time || p.entry_time)} <span class="pill ${cls} ml-2">${st}</span></td>
       </tr>`;
     }).join('');
   }
 
   renderPnlChart(closed);
-}
-
-function renderDebates(rows) {
-  const body = document.getElementById('debate-body');
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="9" class="muted text-center py-8">No debates logged yet</td></tr>';
-    return;
-  }
-  body.innerHTML = rows.map(d => {
-    const decision = d.should_trade ? '<span class="pill pill-yes">TRADE</span>' : '<span class="pill pill-hold">SKIP</span>';
-    return `
-    <tr>
-      <td class="mono">${d.ticker}</td>
-      <td class="mono text-right">${fmtPct(d.bull_prob)}</td>
-      <td class="mono text-right">${fmtPct(d.bear_prob)}</td>
-      <td class="mono text-right">${fmtPct(d.judge_prob)}</td>
-      <td class="mono text-right">${fmtCents(d.market_price)}</td>
-      <td class="mono text-right ${pnlClass(d.edge)}">${fmtPct(d.edge)}</td>
-      <td>${sidePill(d.side)}</td>
-      <td>${decision}</td>
-      <td class="muted">${relTime(d.created_at)}</td>
-    </tr>`;
-  }).join('');
 }
 
 function renderPnlChart(closed) {
@@ -358,16 +548,18 @@ function renderPnlChart(closed) {
 
 async function refresh() {
   try {
-    const [status, stats, positions, debates] = await Promise.all([
+    const [status, stats, positions, council, accuracy] = await Promise.all([
       getJSON('/api/status'),
       getJSON('/api/stats'),
       getJSON('/api/positions'),
-      getJSON('/api/debate_logs'),
+      getJSON('/api/council_decisions'),
+      getJSON('/api/council_accuracy'),
     ]);
     renderStatus(status);
     renderStats(stats);
     renderPositions(positions);
-    renderDebates(debates);
+    renderAccuracy(accuracy);
+    renderCouncil(council);
   } catch (e) {
     console.error('refresh failed', e);
     document.getElementById('hdr-sync').textContent = 'error';

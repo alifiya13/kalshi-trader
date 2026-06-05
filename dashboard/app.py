@@ -21,7 +21,7 @@ from fastapi import Request
 from sqlalchemy import func
 
 from config.settings import settings
-from data.db import DebateLog, PaperTrade, Position, get_session, init_db
+from data.db import CouncilDecision, PaperTrade, Position, get_session, init_db
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -163,13 +163,14 @@ def api_paper_trades() -> list[dict]:
         session.close()
 
 
-@app.get("/api/debate_logs")
-def api_debate_logs() -> list[dict]:
+@app.get("/api/council_decisions")
+def api_council_decisions() -> list[dict]:
+    """Summary row per council run — newest first. Detail is fetched lazily."""
     session = get_session()
     try:
         rows = (
-            session.query(DebateLog)
-            .order_by(DebateLog.created_at.desc())
+            session.query(CouncilDecision)
+            .order_by(CouncilDecision.created_at.desc())
             .limit(50)
             .all()
         )
@@ -178,22 +179,113 @@ def api_debate_logs() -> list[dict]:
                 "id": d.id,
                 "ticker": d.ticker,
                 "market_title": d.market_title,
-                "bull_prob": _num(d.bull_prob),
-                "bear_prob": _num(d.bear_prob),
-                "judge_prob": _num(d.judge_prob),
-                "disagreement": _num(d.disagreement),
-                "market_price": _num(d.market_price),
+                "nws_high": d.weather_nws_high,
+                "market_yes_price": _num(d.market_yes_price),
+                "final_prob": _num(d.stage3_final_prob),
+                "confidence": _num(d.stage3_confidence),
                 "edge": _num(d.edge),
-                "side": d.side,
-                "confidence": _num(d.confidence),
-                "should_trade": bool(d.should_trade),
-                "total_cost": _num(d.total_cost),
+                "should_trade": bool(d.stage3_should_trade),
+                "side": d.stage3_side,
                 "created_at": _iso(d.created_at),
                 "market_result": d.market_result,
                 "was_correct": None if d.was_correct is None else bool(d.was_correct),
             }
             for d in rows
         ]
+    finally:
+        session.close()
+
+
+@app.get("/api/council_decision/{decision_id}")
+def api_council_decision(decision_id: int) -> dict:
+    """Full 3-stage detail for one decision: every model, every reasoning chain."""
+    session = get_session()
+    try:
+        d = session.get(CouncilDecision, decision_id)
+        if d is None:
+            return {"error": "not found", "id": decision_id}
+
+        models = d.council_models or []
+
+        def model_name(i: int) -> str:
+            return models[i] if i < len(models) else f"Model {chr(65 + i)}"
+
+        return {
+            "id": d.id,
+            "ticker": d.ticker,
+            "market_title": d.market_title,
+            "nws_high": d.weather_nws_high,
+            "market_yes_price": _num(d.market_yes_price),
+            "market_no_price": _num(d.market_no_price),
+            "edge": _num(d.edge),
+            "created_at": _iso(d.created_at),
+            "total_cost_usd": _num(d.total_cost_usd),
+            "chairman_model": d.chairman_model,
+            "council_models": models,
+            "market_result": d.market_result,
+            "was_correct": None if d.was_correct is None else bool(d.was_correct),
+            "stage1": [
+                {"label": "Model A", "model": model_name(0), "prob": _num(d.stage1_model_a_prob),
+                 "side": d.stage1_model_a_side, "reasoning": d.stage1_model_a_reasoning},
+                {"label": "Model B", "model": model_name(1), "prob": _num(d.stage1_model_b_prob),
+                 "side": d.stage1_model_b_side, "reasoning": d.stage1_model_b_reasoning},
+                {"label": "Model C", "model": model_name(2), "prob": _num(d.stage1_model_c_prob),
+                 "side": d.stage1_model_c_side, "reasoning": d.stage1_model_c_reasoning},
+            ],
+            "stage2": [
+                {"label": "Model A", "model": model_name(0),
+                 "updated_prob": _num(d.stage2_model_a_updated_prob), "reasoning": d.stage2_model_a_reasoning},
+                {"label": "Model B", "model": model_name(1),
+                 "updated_prob": _num(d.stage2_model_b_updated_prob), "reasoning": d.stage2_model_b_reasoning},
+                {"label": "Model C", "model": model_name(2),
+                 "updated_prob": _num(d.stage2_model_c_updated_prob), "reasoning": d.stage2_model_c_reasoning},
+            ],
+            "stage3": {
+                "model": d.chairman_model,
+                "final_prob": _num(d.stage3_final_prob),
+                "confidence": _num(d.stage3_confidence),
+                "should_trade": bool(d.stage3_should_trade),
+                "side": d.stage3_side,
+                "reasoning": d.stage3_reasoning,
+                "dissent_summary": d.stage3_dissent_summary,
+                "risk_factors": d.stage3_risk_factors,
+            },
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/council_accuracy")
+def api_council_accuracy() -> dict:
+    """How the council is doing: trade/skip split + accuracy on settled markets."""
+    session = get_session()
+    try:
+        rows = session.query(CouncilDecision).all()
+        total = len(rows)
+        trade = sum(1 for d in rows if d.stage3_should_trade)
+        skip = total - trade
+
+        settled = [d for d in rows if d.market_result is not None and d.was_correct is not None]
+        correct = sum(1 for d in settled if d.was_correct)
+        accuracy = (correct / len(settled)) if settled else None
+
+        win_confs = [_num(d.stage3_confidence) for d in settled
+                     if d.was_correct and d.stage3_confidence is not None]
+        lose_confs = [_num(d.stage3_confidence) for d in settled
+                      if not d.was_correct and d.stage3_confidence is not None]
+        avg_conf_win = (sum(win_confs) / len(win_confs)) if win_confs else None
+        avg_conf_lose = (sum(lose_confs) / len(lose_confs)) if lose_confs else None
+
+        return {
+            "total_decisions": total,
+            "trade": trade,
+            "skip": skip,
+            "settled": len(settled),
+            "correct": correct,
+            "accuracy": accuracy,
+            "avg_confidence_winning": avg_conf_win,
+            "avg_confidence_losing": avg_conf_lose,
+        }
     finally:
         session.close()
 
@@ -214,25 +306,16 @@ def api_stats() -> dict:
         best_trade = max(pnls) if pnls else 0.0
         worst_trade = min(pnls) if pnls else 0.0
 
-        # avg_edge from debate logs (edge is stored on debates, not positions)
-        avg_edge_raw = session.query(func.avg(DebateLog.edge)).scalar()
+        # avg edge from council decisions (the research signal lives there now)
+        avg_edge_raw = session.query(func.avg(CouncilDecision.edge)).scalar()
         avg_edge = _num(avg_edge_raw) or 0.0
 
-        # per-strategy breakdown
+        # per-strategy breakdown — council research is weather_council only
         strategies: dict[str, dict[str, float]] = {
-            "weather": {"count": 0, "pnl": 0.0},
-            "ai_debate": {"count": 0, "pnl": 0.0},
-            "compounder": {"count": 0, "pnl": 0.0},
-        }
-        _alias = {
-            "weather_v1": "weather",
-            "weather": "weather",
-            "ai_debate": "ai_debate",
-            "safe_compounder": "compounder",
-            "compounder": "compounder",
+            "weather_council": {"count": 0, "pnl": 0.0},
         }
         for p in closed:
-            key = _alias.get((p.strategy or "").lower(), (p.strategy or "other").lower())
+            key = (p.strategy or "other").lower()
             bucket = strategies.setdefault(key, {"count": 0, "pnl": 0.0})
             bucket["count"] += 1
             bucket["pnl"] += _num(p.realized_pnl) or 0.0

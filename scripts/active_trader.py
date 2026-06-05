@@ -61,6 +61,7 @@ from execution.position_manager import PositionManager, ExitAction
 from execution.risk_engine import RiskEngine, TradeSignal
 from agents.council import WeatherCouncil, persist_council_decision
 from strategies.weather import get_weather_context, parse_ticker_date
+from scripts.settle_council import settle_council_decisions
 from monitoring.telegram_bot import (
     alert_startup,
     alert_new_position,
@@ -524,6 +525,19 @@ def main():
                     console.print(f"  [red]Scan error: {e}[/]")
                     alert_error(f"Scan error: {e}")
                 last_scan = now
+
+                # Settlement check — reconcile council decisions + positions
+                # against Kalshi. Public API only, no LLM cost. Once per scan.
+                try:
+                    settle_stats = settle_council_decisions(data_client, verbose=False)
+                    if settle_stats["decisions_settled"] or settle_stats["positions_settled"]:
+                        console.print(
+                            f"  [blue]Settled {settle_stats['decisions_settled']} decision(s), "
+                            f"{settle_stats['positions_settled']} position(s)[/]"
+                        )
+                except Exception as e:
+                    console.print(f"  [yellow]Settlement check failed: {e}[/]")
+
                 pm.load_open_positions()
                 alert_scan_summary(
                     num_markets=scan_stats["num_markets"],
