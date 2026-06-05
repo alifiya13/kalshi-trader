@@ -34,6 +34,7 @@ logger = structlog.get_logger()
 _PRICING: dict[str, tuple[float, float]] = {
     # model_id: (input_per_1m, output_per_1m) — LLM Gateway bare names
     "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-flash-lite": (0.10, 0.40),
     "deepseek-v3.2": (0.27, 1.10),
     "claude-sonnet-4-20250514": (3.00, 15.00),
     "claude-sonnet-4-6": (3.00, 15.00),

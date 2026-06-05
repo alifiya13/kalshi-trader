@@ -50,6 +50,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from statistics import mean, pstdev
 from typing import Optional
 
 import requests
@@ -594,6 +595,79 @@ def parse_ticker_date(ticker: str) -> Optional[date]:
         return date(2000 + int(yy), month, int(dd))
     except ValueError:
         return None
+
+
+def get_weather_context(
+    target_date: Optional[date] = None,
+    latitude: float = NYC_LAT,
+    longitude: float = NYC_LON,
+) -> dict:
+    """
+    Package the day's weather forecast data into a clean dict for the LLM
+    council (agents/council.py). This is the WEATHER half of the council's
+    context packet; the caller pairs it with live Kalshi market data.
+
+    Returns:
+        {
+            "target_date":       "2026-06-06",
+            "gfs_forecast":      {mean, min, max, stdev, n_members, members[°F]} | None,
+            "icon_forecast":     {...} | None,
+            "nws_high":          int | None,     # official NWS forecast high
+            "nws_short_forecast": str | None,    # e.g. "Partly Sunny"
+            "ensemble_mean":     float | None,   # across ALL members of ALL models
+            "ensemble_spread":   float,          # population stdev across all members
+            "all_member_temps":  [float, ...],   # every member's daily-high °F
+            "n_members":         int,            # total members across all models
+            "n_models":          int,            # count of valid ensembles
+        }
+
+    Mirrors the data find_weather_edge() consumes (GFS/ICON ensembles + NWS),
+    but returns descriptive statistics + raw members instead of per-market
+    probabilities — the council reasons over the distribution itself.
+    """
+    if target_date is None:
+        now_nyc = datetime.now(timezone(timedelta(hours=-4)))
+        target_date = (now_nyc + timedelta(days=1)).date()
+
+    ensembles = fetch_weather_forecast(latitude, longitude, hours_ahead=48)
+
+    # Collapse each ensemble to per-member daily highs for the target date.
+    per_model: dict[str, list[float]] = {}
+    for model, fc in ensembles.items():
+        maxes = _daily_max_per_member(fc, target_date)
+        if maxes:
+            per_model[model] = maxes
+
+    def _stats(vals: list[float]) -> Optional[dict]:
+        if not vals:
+            return None
+        return {
+            "mean": round(mean(vals), 2),
+            "min": round(min(vals), 1),
+            "max": round(max(vals), 1),
+            "stdev": round(pstdev(vals), 2) if len(vals) > 1 else 0.0,
+            "n_members": len(vals),
+            "members": [round(v, 1) for v in vals],
+        }
+
+    all_temps = [t for lst in per_model.values() for t in lst]
+    ensemble_mean = round(mean(all_temps), 2) if all_temps else None
+    ensemble_spread = round(pstdev(all_temps), 2) if len(all_temps) > 1 else 0.0
+
+    nws = fetch_nws_forecast(latitude, longitude, target_date=target_date)
+
+    return {
+        "target_date": target_date.isoformat(),
+        "gfs_forecast": _stats(per_model.get("gfs_seamless", [])),
+        "icon_forecast": _stats(per_model.get("icon_seamless", [])),
+        "nws_high": nws["forecast_high_f"] if nws else None,
+        "nws_short_forecast": nws["short_forecast"] if nws else None,
+        "ensemble_mean": ensemble_mean,
+        "ensemble_spread": ensemble_spread,
+        "all_member_temps": [round(v, 1) for v in all_temps],
+        "n_members": len(all_temps),
+        "n_models": len(per_model),
+    }
 
 
 def find_weather_edge(

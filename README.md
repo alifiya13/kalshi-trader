@@ -1,99 +1,133 @@
-# Kalshi Automated Trading System
+# When the Council Is Wrong
+## A study of how multi-LLM councils fail at prediction-market decisions
 
-A quantitative trading system for Kalshi prediction markets.
+This project runs a **3-stage LLM council** over weather markets on
+[Kalshi](https://kalshi.com) and records every decision so we can study *when
+the council gets it wrong, and why*. It is a research instrument, not a money
+machine — **all trading is paper trading** (no real or live demo orders are
+placed).
 
-## Quick Start (do these in order)
+The bet behind the project: a panel of diverse LLMs that critique each other
+should make better-calibrated probability estimates than any single model. The
+research question is the inverse — **where does that break down?** When does
+peer review push the council toward a *worse* answer, manufacture false
+consensus, or fail to veto a bad trade?
 
-### Step 1: Install dependencies
-```bash
-cd kalshi-trader
-pip install -r requirements.txt
-```
+---
 
-### Step 2: Create your .env file
-```bash
-cp .env.example .env
-```
+## How it works
 
-Edit `.env` — for now, leave the API key fields empty. The public endpoints
-work without auth, so you can test immediately.
+For each candidate weather market, three cheap LLMs and one stronger "chairman"
+run a council adapted from [Karpathy's llm-council](https://github.com/karpathy/llm-council):
 
-### Step 3: Run the smoke test
-```bash
-python -m scripts.smoke_test
-```
+1. **Stage 1 — Independent Analysis.** Each council model gets the *same*
+   context packet (ensemble + official forecast + live market prices) and
+   answers independently: `{probability, side, confidence, reasoning}`.
+2. **Stage 2 — Peer Review.** Each model sees the whole panel's Stage-1 answers,
+   **anonymized as "Model A / B / C"** (it can't tell which is its own or who
+   wrote what), and may revise: `{updated_probability, agreements, disagreements, reasoning}`.
+3. **Stage 3 — Chairman Synthesis.** A stronger model reads every Stage-1 answer
+   and every Stage-2 review and issues the final call:
+   `{final_probability, confidence, should_trade, side, dissent_summary, reasoning, risk_factors}`.
 
-This verifies: config loads → database creates → public API works → orderbook
-parses → Kelly sizer computes. If auth is not configured, it skips that step
-gracefully and tells you what to do.
+Every stage, every model's probability, and every reasoning chain is persisted
+to the **`council_decisions`** table — the raw material for studying failures.
 
-### Step 4: Scan all markets
-```bash
-python -m scripts.scan_markets
-```
+Council models: `gemini-2.5-flash-lite`, `deepseek-v3.2`, `gpt-4o-mini`.
+Chairman: `claude-sonnet-4-20250514`. All via an OpenAI-compatible LLM Gateway.
+A full council run costs roughly **$0.012–0.016**.
 
-This pulls every open market on Kalshi and shows you:
-- Category breakdown (sports, crypto, economics, etc.)
-- Top 25 markets by volume
-- Spread and depth analysis for top 10
+### Weather data
 
-### Step 5: Watch a live market
-```bash
-# Auto-pick highest volume market:
-python -m scripts.watch_orderbook
+The market in question is **KXHIGHNY** — the NWS-settled daily high temperature
+at NYC Central Park. We feed the council three forecast sources:
 
-# Watch a specific series (e.g., BTC 15-minute):
-python -m scripts.watch_orderbook KXBTC15M
+- **GFS** ensemble (NOAA GEFS, ~31 members) via Open-Meteo
+- **ICON** ensemble (DWD, ~40 members) via Open-Meteo
+- **NWS** official forecast high — the *literal settlement source* for the market
 
-# Watch an exact market:
-python -m scripts.watch_orderbook --ticker KXBTC15M-26APR09-T100000
-```
+These markets are a clean testbed: the settlement source is public and
+deterministic, books quote tight spreads, and the outcome resolves in ~24h.
 
-This is your first "trading screen" — watch how prices move, how spreads
-tighten and widen, and where volume clusters.
+### The combined decision
 
-### Step 6: Set up API keys (when ready to paper trade)
-1. Go to https://demo.kalshi.co and create a demo account
-2. Go to Account Settings → API Keys → Create New API Key
-3. Save the private key PEM file to `keys/kalshi-private.pem`
-4. Update `.env`:
-   ```
-   KALSHI_API_KEY_ID=your-key-id-here
-   KALSHI_PRIVATE_KEY_PATH=./keys/kalshi-private.pem
-   KALSHI_ENV=demo
-   ```
-5. Re-run smoke test to verify auth works
+The weather model and the council must **both agree** before a paper trade is
+recorded:
 
-## Project Structure
+- weather model edge ≥ **15¢**, **and**
+- council `should_trade == true`, **and**
+- council confidence > **0.6**
+
+If either disagrees, no trade — but the council decision is logged regardless.
+The interesting research cases are exactly the disagreements.
+
+### Monitoring
+
+A FastAPI dashboard (`dashboard/app.py`) reads the same database and shows
+positions, P&L, and decision history. On Railway it runs as the `web` process.
+
+---
+
+## Layout
 
 ```
 kalshi-trader/
-├── config/
-│   ├── settings.py        ← Central config (loads .env)
-│   └── constants.py       ← Rate limits, categories, watched series
-├── core/
-│   ├── auth.py            ← RSA-PSS request signing
-│   ├── rest_client.py     ← Authenticated REST API wrapper
-│   └── rate_limiter.py    ← Token bucket rate limiter
-├── data/
-│   ├── db.py              ← SQLAlchemy models + connection
-│   └── market_scanner.py  ← Market discovery and cataloging
+├── agents/
+│   ├── council.py          ← the 3-stage WeatherCouncil engine
+│   └── base_agent.py       ← LLM Gateway client + JSON extraction + cost logging
 ├── strategies/
-│   └── kelly.py           ← Fractional Kelly position sizing
-├── execution/             ← (Phase 2: order management)
-├── monitoring/            ← (Phase 3: dashboards, alerts)
+│   └── weather.py          ← GFS/ICON/NWS pipeline + get_weather_context()
+├── execution/
+│   ├── risk_engine.py      ← sizes council-approved (paper) positions
+│   ├── position_manager.py ← exit logic (stop-loss disabled for weather)
+│   └── order_executor.py   ← order plumbing (paper flow does not call it)
+├── core/                   ← Kalshi REST client, RSA-PSS auth, rate limiter
+├── data/
+│   ├── db.py               ← SQLAlchemy models incl. council_decisions
+│   └── market_scanner.py   ← category inference used by the risk engine
+├── monitoring/telegram_bot.py
+├── dashboard/app.py        ← FastAPI monitoring dashboard
+├── analysis/analyze_trades.py  ← retrospective P&L / calibration analysis
 ├── scripts/
-│   ├── smoke_test.py      ← Run first — verifies everything
-│   ├── scan_markets.py    ← Find where the money is
-│   └── watch_orderbook.py ← Live market viewer
-├── .env.example           ← Template for secrets
-├── .gitignore
-├── requirements.txt
-└── README.md
+│   ├── active_trader.py    ← main loop: weather scan → council → paper trade
+│   ├── council_test.py     ← run the council on one live market, print everything
+│   └── wipe_db.py          ← clean-slate DB wipe
+├── config/settings.py
+├── Procfile · railway.toml · runtime.txt
+└── requirements.txt
 ```
 
-## Risk Warning
+---
 
-Trading prediction markets involves substantial risk of loss. Start with
-demo money. Paper trade for 2+ weeks before using real funds. Never trade
-money you can't afford to lose.
+## Quick start
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # then fill in LLM_GATEWAY_API_KEY, DATABASE_URL, Kalshi keys
+```
+
+Run the council on one real KXHIGHNY market and print every stage (no trade,
+no DB writes):
+
+```bash
+python -m scripts.council_test
+```
+
+Run the continuous paper-trading engine (dry-run by default):
+
+```bash
+python -m scripts.active_trader
+```
+
+Launch the dashboard:
+
+```bash
+uvicorn dashboard.app:app --reload
+```
+
+---
+
+## Note
+
+This is a research project about decision quality, not investment advice. Every
+trade here is on paper. The point is the data in `council_decisions`, not P&L.

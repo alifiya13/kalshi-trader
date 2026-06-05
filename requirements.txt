@@ -1,39 +1,27 @@
-# Kalshi Trading System — Dependencies
+# LLM Council Research — Dependencies
 # Install: pip install -r requirements.txt
 
-# === Core ===
+# === Kalshi REST + auth ===
 requests>=2.31.0
-websockets>=12.0
 cryptography>=42.0.0
-
-# === Data & Math ===
-numpy>=1.26.0
-pandas>=2.2.0
-scipy>=1.12.0
 
 # === Database ===
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.9
-alembic>=1.13.0
-
-# === Async ===
-aiohttp>=3.9.0
 
 # === Config & Environment ===
-python-dotenv>=1.0.0
+python-dotenv>=1.0.0        # backs pydantic-settings env_file parsing
 pydantic>=2.6.0
 pydantic-settings>=2.1.0
 
 # === Monitoring & Logging ===
-rich>=13.7.0               # pretty console output
+rich>=13.7.0                # pretty console output
 structlog>=24.1.0           # structured logging
 
-# === Dashboard ===
-streamlit>=1.31.0
-plotly>=5.18.0
+# === Dashboard (FastAPI) ===
 fastapi>=0.110.0
 uvicorn>=0.27.0
 jinja2>=3.1.0
 
-# === AI Debate ===
+# === LLM Council (OpenAI-compatible LLM Gateway) ===
 openai>=1.12.0

@@ -5,6 +5,8 @@ keys/
 __pycache__/
 *.pyc
 *.db
+*.db-shm
+*.db-wal
 logs/
 data/market_scan_results.csv
 .vscode/

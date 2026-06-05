@@ -102,11 +102,10 @@ class PaperTrade(Base):
     """
     A logged but NOT-executed trade used for strategy validation.
 
-    Paper trades are recorded by scripts/paper_trader.py when a signal
-    clears both the strategy's tradeability gate and the Kelly sizer.
-    scripts/paper_settle.py fills in result/pnl/settled_at once the
-    underlying Kalshi market resolves. Only settled rows contribute to
-    strategy performance metrics — unsettled rows are "open positions".
+    LEGACY: this table belonged to the old standalone paper-trader pipeline
+    (since removed). It is retained because the dashboard still reads
+    historical rows, but nothing writes to it anymore — the current flow logs
+    decisions to `council_decisions` and paper positions to `positions`.
     """
     __tablename__ = "paper_trades"
 
@@ -162,6 +161,65 @@ class DebateLog(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # Filled in after settlement
+    market_result = Column(String, nullable=True)   # "yes" | "no"
+    was_correct = Column(Integer, nullable=True)    # 0/1
+
+
+class CouncilDecision(Base):
+    """
+    Full audit trail of one 3-stage WeatherCouncil run (agents/council.py).
+
+    The council (adapted from Karpathy's llm-council) is a research instrument
+    for studying *failure modes*, so we persist every stage and every model's
+    probability + reasoning chain. The Stage-1/2 columns are POSITIONAL
+    (model_a / model_b / model_c) — the A/B/C labels map to
+    WeatherCouncil.council_models in order (also stored verbatim in the
+    `council_models` JSON column). Outcome columns (market_result,
+    was_correct) stay null until the market settles and a reconciliation job
+    fills them in.
+    """
+    __tablename__ = "council_decisions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String, index=True)
+    market_title = Column(Text)
+
+    # --- Stage 1: independent analysis (positional A/B/C) ---
+    stage1_model_a_prob = Column(Numeric)
+    stage1_model_a_reasoning = Column(Text)
+    stage1_model_b_prob = Column(Numeric)
+    stage1_model_b_reasoning = Column(Text)
+    stage1_model_c_prob = Column(Numeric)
+    stage1_model_c_reasoning = Column(Text)
+
+    # --- Stage 2: peer review (updated probabilities) ---
+    stage2_model_a_updated_prob = Column(Numeric)
+    stage2_model_a_reasoning = Column(Text)
+    stage2_model_b_updated_prob = Column(Numeric)
+    stage2_model_b_reasoning = Column(Text)
+    stage2_model_c_updated_prob = Column(Numeric)
+    stage2_model_c_reasoning = Column(Text)
+
+    # --- Stage 3: chairman synthesis ---
+    stage3_final_prob = Column(Numeric)
+    stage3_confidence = Column(Numeric)
+    stage3_should_trade = Column(Integer)   # 0/1 (no native bool on SQLite)
+    stage3_side = Column(String)            # "yes" | "no"
+    stage3_reasoning = Column(Text)
+
+    # --- Market snapshot + edge at decision time ---
+    market_yes_price = Column(Numeric)
+    market_no_price = Column(Numeric)
+    edge = Column(Numeric)
+    weather_nws_high = Column(Integer, nullable=True)
+
+    # --- Bookkeeping ---
+    council_models = Column(JSON, nullable=True)   # [model_a, model_b, model_c]
+    chairman_model = Column(String, nullable=True)
+    total_cost_usd = Column(Numeric)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    # --- Filled in after settlement ---
     market_result = Column(String, nullable=True)   # "yes" | "no"
     was_correct = Column(Integer, nullable=True)    # 0/1
 
