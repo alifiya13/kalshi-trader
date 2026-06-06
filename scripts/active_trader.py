@@ -26,7 +26,7 @@ not an option (research mandate).
 There are NO trading gates. No edge threshold, no confidence
 floor, no risk engine. The council's decision IS the decision —
 that's the experiment. The only limits are cost controls:
-  - $2/day cap on LLM spend (many cities now)
+  - $5/day cap on LLM spend (many cities now)
   - 30-minute interval between scans
   - each event is decided at most once (dedup by event_ticker)
 
