@@ -189,17 +189,21 @@ class CouncilDecision(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     council_run_id = Column(String, index=True)   # UUID — groups trades from one run
+    event_ticker = Column(String, index=True)     # e.g. KXHIGHCHI-26JUN07 — dedup key
+    city = Column(String, index=True)             # parsed from the event title
+    temp_type = Column(String)                    # "high" | "low"
     ticker = Column(String, index=True)
     market_title = Column(Text)
 
     # --- Event-level temperature predictions (shared across the run) ---
-    predicted_high_f = Column(Numeric, nullable=True)   # chairman's final prediction
-    stage1_model_a_predicted_high = Column(Numeric, nullable=True)
-    stage1_model_b_predicted_high = Column(Numeric, nullable=True)
-    stage1_model_c_predicted_high = Column(Numeric, nullable=True)
-    stage2_model_a_updated_high = Column(Numeric, nullable=True)
-    stage2_model_b_updated_high = Column(Numeric, nullable=True)
-    stage2_model_c_updated_high = Column(Numeric, nullable=True)
+    # "temp" = the daily extreme the event asks about (high or low).
+    predicted_temp_f = Column(Numeric, nullable=True)   # chairman's final prediction
+    stage1_model_a_predicted_temp = Column(Numeric, nullable=True)
+    stage1_model_b_predicted_temp = Column(Numeric, nullable=True)
+    stage1_model_c_predicted_temp = Column(Numeric, nullable=True)
+    stage2_model_a_updated_temp = Column(Numeric, nullable=True)
+    stage2_model_b_updated_temp = Column(Numeric, nullable=True)
+    stage2_model_c_updated_temp = Column(Numeric, nullable=True)
 
     # --- Stage 1: independent analysis (positional A/B/C) ---
     # prob/side are legacy (per-bracket era); reasoning now holds the model's
@@ -236,6 +240,8 @@ class CouncilDecision(Base):
     market_yes_price = Column(Numeric)
     market_no_price = Column(Numeric)
     edge = Column(Numeric)
+    # NWS forecast for the event's variable (high OR low). Name kept from
+    # the NYC-high era because the dashboard reads it.
     weather_nws_high = Column(Integer, nullable=True)
 
     # --- Bookkeeping ---

@@ -8,26 +8,28 @@ extraction, retry/cost logging) is our existing agents/base_agent.py.
 
 Event-level model (2026-06-06): the council runs ONCE per weather event and
 sees ALL brackets (B-bands + T-tails) with their YES/NO prices together. It
-predicts the high temperature and selects which brackets to trade. The
-chairman MUST select at least one trade — this is a research study measuring
-council accuracy, so "skip" is not a decision we can score.
+works for ANY city and either daily extreme — the event carries its own
+city/temp_type ("high"/"low") from data/weather_discovery.py. The council
+predicts the temperature and selects which brackets to trade. The chairman
+MUST select at least one trade — this is a research study measuring council
+accuracy, so "skip" is not a decision we can score.
 
     STAGE 1 — Independent Analysis
         Each council model receives the SAME context packet (ensemble +
         NWS forecast + the FULL bracket table) and answers independently:
-        {predicted_high_f, confidence, trades: [{ticker, side, reasoning}]}.
+        {predicted_temp_f, confidence, trades: [{ticker, side, reasoning}]}.
 
     STAGE 2 — Peer Review
         Each model sees the WHOLE panel's Stage-1 answers, anonymized as
         "Model A / Model B / Model C" (it can't tell which is its own or
         who wrote what), and may update its prediction + trade selections:
-        {updated_predicted_high_f, updated_trades, agreements, disagreements}.
+        {updated_predicted_temp_f, updated_trades, agreements, disagreements}.
 
     STAGE 3 — Chairman Synthesis
         One stronger model sees every Stage-1 answer + every Stage-2 review
         and produces the final call — at least one trade, each with a
         win probability:
-        {predicted_high_f, confidence, trades: [{ticker, side, probability,
+        {predicted_temp_f, confidence, trades: [{ticker, side, probability,
          reasoning}], dissent_summary, risk_factors, overall_reasoning}.
 
 Design note: the A/B/C labels are STABLE across stages and map positionally
@@ -108,7 +110,7 @@ class TradeCall:
 class Stage1Answer:
     model: str
     label: str
-    predicted_high_f: Optional[float]  # the model's NYC daily-high prediction
+    predicted_temp_f: Optional[float]  # the model's daily high/low prediction
     confidence: Optional[float]        # 0..1
     trades: list[TradeCall] = field(default_factory=list)
     raw_text: str = ""
@@ -120,7 +122,7 @@ class Stage1Answer:
 class Stage2Review:
     model: str
     label: str
-    updated_predicted_high_f: Optional[float]
+    updated_predicted_temp_f: Optional[float]
     updated_trades: list[TradeCall] = field(default_factory=list)
     agreements: str = ""
     disagreements: str = ""
@@ -132,7 +134,7 @@ class Stage2Review:
 @dataclass
 class Stage3Synthesis:
     model: str
-    predicted_high_f: Optional[float]
+    predicted_temp_f: Optional[float]
     confidence: Optional[float]
     trades: list[TradeCall] = field(default_factory=list)  # ≥1, each with probability
     dissent_summary: str = ""
@@ -153,7 +155,7 @@ class CouncilEventResult:
     stage3_result: Stage3Synthesis
 
     # Chairman's final call, surfaced for convenience
-    predicted_high_f: Optional[float]
+    predicted_temp_f: Optional[float]
     confidence: Optional[float]
     trades: list[TradeCall]            # the trades to paper-trade (≥1)
     total_cost: float
@@ -256,9 +258,11 @@ class WeatherCouncil:
         council = WeatherCouncil()
         result = council.run_council(weather_data, event_data)
 
-    `event_data` is the dict from strategies.weather.get_weather_event_with_brackets:
-        {event_date, series_ticker, brackets: [{ticker, threshold, type,
-         yes_price, no_price, volume, ...}, ...]}
+    `event_data` is WeatherEvent.as_council_event() from
+    data/weather_discovery.py:
+        {event_ticker, event_date, series_ticker, city, temp_type,
+         brackets: [{ticker, threshold, type, yes_price, no_price,
+         volume, ...}, ...]}
     """
 
     def __init__(
@@ -283,8 +287,10 @@ class WeatherCouncil:
             date_label = f"{ev_date:%b} {ev_date.day}, {ev_date.year}"
         else:
             date_label = str(ev_date)
+        city = event_data.get("city") or "the city"
+        kind = "Low" if event_data.get("temp_type") == "low" else "High"
 
-        lines = [f"Available brackets for NYC High Temperature on {date_label}:"]
+        lines = [f"Available brackets for {city} {kind} Temperature on {date_label}:"]
         for b in event_data.get("brackets", []):
             suffix = b["ticker"].rsplit("-", 1)[-1]
             lines.append(
@@ -311,36 +317,39 @@ class WeatherCouncil:
             )
 
         w = weather_data
+        city = event_data.get("city") or w.get("city") or "the city"
+        kind = "low" if event_data.get("temp_type") == "low" else "high"
 
-        nws_high = w.get("nws_high")
+        nws_temp = w.get("nws_temp")
         nws_line = (
-            f"{nws_high}°F"
+            f"{nws_temp}°F"
             + (f" ({w.get('nws_short_forecast')})" if w.get("nws_short_forecast") else "")
-            if nws_high is not None
+            if nws_temp is not None
             else "(unavailable)"
         )
 
         lines = [
-            "=== WEATHER FORECAST (NYC Central Park / KNYC) ===",
+            f"=== WEATHER FORECAST ({city}) ===",
             f"  Target date (observation day): {w.get('target_date')}",
-            fc_line("GFS ensemble", w.get("gfs_forecast")),
-            fc_line("ICON ensemble", w.get("icon_forecast")),
+            f"  Variable: daily {kind.upper()} temperature",
+            fc_line(f"GFS ensemble (per-member daily {kind})", w.get("gfs_forecast")),
+            fc_line(f"ICON ensemble (per-member daily {kind})", w.get("icon_forecast")),
             f"  Combined ensemble: mean={w.get('ensemble_mean')}°F  "
             f"spread(stdev)={w.get('ensemble_spread')}°F  "
             f"total_members={w.get('n_members')}  models={w.get('n_models')}",
-            f"  NWS OFFICIAL forecast high: {nws_line}",
+            f"  NWS OFFICIAL forecast {kind}: {nws_line}",
             "  NOTE: NWS is the LITERAL settlement source for these markets.",
             "",
             "=== KALSHI EVENT — ALL BRACKETS ===",
             self._bracket_table(event_data),
             "",
             "  The brackets are mutually exclusive: exactly ONE settles YES",
-            "  (the one containing the observed NWS daily high, integer °F).",
+            f"  (the one containing the observed NWS daily {kind}, integer °F).",
             "  In your trades, use the full ticker exactly as given above.",
             "",
             "=== QUESTION ===",
             "  Given the weather data and these market prices, what temperature",
-            "  do you predict for the NYC high? Which bracket(s) would you",
+            f"  do you predict for the {city} {kind}? Which bracket(s) would you",
             "  trade? For each bracket you'd trade, specify: buy YES or NO,",
             "  and why.",
         ]
@@ -352,22 +361,22 @@ class WeatherCouncil:
 
     _STAGE1_SYSTEM = (
         "You are a quantitative weather-derivatives analyst serving on a "
-        "decision council. You price NWS-settled daily-high temperature "
-        "markets on Kalshi. You are given ensemble forecasts (GFS, ICON), "
-        "the official NWS forecast (the literal settlement source), and the "
-        "FULL set of temperature brackets for one event with live YES/NO "
-        "prices. First predict the daily high, then pick which brackets are "
-        "mispriced relative to your prediction and the forecast uncertainty. "
-        "Reason explicitly about: ensemble spread, how much to trust NWS vs "
-        "the raw ensembles, and what each bracket's price implies. Be "
-        "calibrated and concrete. Respond with ONLY a JSON object, no prose "
-        "outside it."
+        "decision council. You price NWS-settled daily temperature (high or "
+        "low) markets on Kalshi. You are given ensemble forecasts (GFS, "
+        "ICON), the official NWS forecast (the literal settlement source), "
+        "and the FULL set of temperature brackets for one event with live "
+        "YES/NO prices. First predict the day's temperature extreme the "
+        "event asks about, then pick which brackets are mispriced relative "
+        "to your prediction and the forecast uncertainty. Reason explicitly "
+        "about: ensemble spread, how much to trust NWS vs the raw "
+        "ensembles, and what each bracket's price implies. Be calibrated "
+        "and concrete. Respond with ONLY a JSON object, no prose outside it."
     )
 
     _STAGE1_SCHEMA = (
         'Respond with ONLY this JSON:\n'
         '{\n'
-        '  "predicted_high_f": <float, your predicted NYC daily high in °F>,\n'
+        '  "predicted_temp_f": <float, your predicted temperature in °F (the daily high or low the event asks about)>,\n'
         '  "confidence": <float 0..1, how sure you are of the prediction>,\n'
         '  "trades": [\n'
         '    {"ticker": "<full bracket ticker>", "side": "yes" | "no",\n'
@@ -394,19 +403,19 @@ class WeatherCouncil:
                 answers.append(Stage1Answer(
                     model=model,
                     label=label,
-                    predicted_high_f=_to_float(p.get("predicted_high_f")),
+                    predicted_temp_f=_to_float(p.get("predicted_temp_f")),
                     confidence=_clamp01(_to_float(p.get("confidence"))),
                     trades=_parse_trades(p.get("trades"), valid_tickers),
                     raw_text=resp.raw_text,
                     cost_usd=resp.cost_usd,
                 ))
                 logger.info("council_stage1", model=model, label=label,
-                            predicted_high=answers[-1].predicted_high_f,
+                            predicted_temp=answers[-1].predicted_temp_f,
                             n_trades=len(answers[-1].trades))
             except Exception as e:
                 logger.warning("council_stage1_failed", model=model, error=str(e)[:200])
                 answers.append(Stage1Answer(
-                    model=model, label=label, predicted_high_f=None,
+                    model=model, label=label, predicted_temp_f=None,
                     confidence=None, error=str(e)[:300],
                 ))
         return answers
@@ -419,7 +428,7 @@ class WeatherCouncil:
         "You are on a weather-market analyst council. You have already given "
         "your own independent analysis. Below is the WHOLE panel's analysis, "
         "ANONYMIZED (you cannot tell which one is yours or who wrote any of "
-        "them) — each member's predicted high temperature and the bracket "
+        "them) — each member's predicted temperature and the bracket "
         "trades they selected. Critically review the panel: where do you "
         "agree, where do you disagree, and does anyone raise a point that "
         "should move your prediction or change which brackets you'd trade? "
@@ -430,7 +439,7 @@ class WeatherCouncil:
     _STAGE2_SCHEMA = (
         'Respond with ONLY this JSON:\n'
         '{\n'
-        '  "updated_predicted_high_f": <float, your revised predicted high °F>,\n'
+        '  "updated_predicted_temp_f": <float, your revised predicted temperature °F>,\n'
         '  "updated_trades": [\n'
         '    {"ticker": "<full bracket ticker>", "side": "yes" | "no",\n'
         '     "reasoning": "<why>"},\n'
@@ -449,7 +458,7 @@ class WeatherCouncil:
                 continue
             blocks.append(
                 f"{a.label}:\n"
-                f"  Predicted high = {a.predicted_high_f}°F  "
+                f"  Predicted high = {a.predicted_temp_f}°F  "
                 f"confidence = {a.confidence}\n"
                 f"  Trades:\n{_trades_text(a.trades)}"
             )
@@ -479,7 +488,7 @@ class WeatherCouncil:
                 reviews.append(Stage2Review(
                     model=model,
                     label=label,
-                    updated_predicted_high_f=_to_float(p.get("updated_predicted_high_f")),
+                    updated_predicted_temp_f=_to_float(p.get("updated_predicted_temp_f")),
                     updated_trades=_parse_trades(p.get("updated_trades"), valid_tickers),
                     agreements=_as_text(p.get("agreements")),
                     disagreements=_as_text(p.get("disagreements")),
@@ -487,12 +496,12 @@ class WeatherCouncil:
                     cost_usd=resp.cost_usd,
                 ))
                 logger.info("council_stage2", model=model, label=label,
-                            updated_high=reviews[-1].updated_predicted_high_f,
+                            updated_temp=reviews[-1].updated_predicted_temp_f,
                             n_trades=len(reviews[-1].updated_trades))
             except Exception as e:
                 logger.warning("council_stage2_failed", model=model, error=str(e)[:200])
                 reviews.append(Stage2Review(
-                    model=model, label=label, updated_predicted_high_f=None,
+                    model=model, label=label, updated_predicted_temp_f=None,
                     error=str(e)[:300],
                 ))
         return reviews
@@ -505,7 +514,7 @@ class WeatherCouncil:
         "You are the CHAIRMAN of a weather-market analyst council. You see "
         "the council's independent analyses (Stage 1) and their anonymized "
         "peer reviews (Stage 2). Synthesize them into one final decision: a "
-        "predicted high temperature and the bracket trades to place. Weigh "
+        "predicted temperature and the bracket trades to place. Weigh "
         "the NWS official forecast heavily — it is the literal settlement "
         "source. Treat disagreement among analysts as a genuine risk signal "
         "and fold it into each trade's win probability. You MUST select at "
@@ -518,7 +527,7 @@ class WeatherCouncil:
     _STAGE3_SCHEMA = (
         'Respond with ONLY this JSON:\n'
         '{\n'
-        '  "predicted_high_f": <float, final predicted NYC daily high °F>,\n'
+        '  "predicted_temp_f": <float, final predicted temperature °F (the daily high or low the event asks about)>,\n'
         '  "confidence": <float 0..1>,\n'
         '  "trades": [\n'
         '    {"ticker": "<full bracket ticker>", "side": "yes" | "no",\n'
@@ -540,7 +549,7 @@ class WeatherCouncil:
                 continue
             blocks.append(
                 f"{r.label} (updated):\n"
-                f"  Updated predicted high = {r.updated_predicted_high_f}°F\n"
+                f"  Updated predicted high = {r.updated_predicted_temp_f}°F\n"
                 f"  Updated trades:\n{_trades_text(r.updated_trades)}\n"
                 f"  Agreements: {r.agreements}\n"
                 f"  Disagreements: {r.disagreements}"
@@ -571,7 +580,7 @@ class WeatherCouncil:
             p = resp.parsed
             return Stage3Synthesis(
                 model=self.chairman_model,
-                predicted_high_f=_to_float(p.get("predicted_high_f")),
+                predicted_temp_f=_to_float(p.get("predicted_temp_f")),
                 confidence=_clamp01(_to_float(p.get("confidence"))),
                 trades=_parse_trades(p.get("trades"), valid_tickers, with_probability=True),
                 dissent_summary=_as_text(p.get("dissent_summary")),
@@ -583,7 +592,7 @@ class WeatherCouncil:
         except Exception as e:
             logger.warning("council_stage3_failed", model=self.chairman_model, error=str(e)[:200])
             return Stage3Synthesis(
-                model=self.chairman_model, predicted_high_f=None, confidence=None,
+                model=self.chairman_model, predicted_temp_f=None, confidence=None,
                 error=str(e)[:300],
             )
 
@@ -597,14 +606,14 @@ class WeatherCouncil:
         The chairman must always trade. If it returned zero VALID trades
         (refused, hallucinated tickers, or errored), synthesize one
         deterministically: buy YES on the bracket containing (or nearest to)
-        the best available predicted high. Marked as a fallback in the
+        the best available predicted temperature. Marked as a fallback in the
         reasoning so research analysis can separate these rows.
         """
         brackets = event_data.get("brackets", [])
         if not brackets:
             return None
 
-        predicted = stage3.predicted_high_f
+        predicted = stage3.predicted_temp_f
 
         def _dist(b: dict) -> float:
             if predicted is None:
@@ -627,7 +636,7 @@ class WeatherCouncil:
             reasoning=(
                 "FALLBACK: chairman returned no valid trade "
                 f"({'error: ' + stage3.error if stage3.error else 'empty/invalid trades list'}); "
-                f"auto-selected the bracket nearest predicted high "
+                f"auto-selected the bracket nearest predicted temperature "
                 f"{predicted}°F."
             ),
         )
@@ -672,7 +681,7 @@ class WeatherCouncil:
             stage1_results=stage1,
             stage2_results=stage2,
             stage3_result=stage3,
-            predicted_high_f=stage3.predicted_high_f,
+            predicted_temp_f=stage3.predicted_temp_f,
             confidence=stage3.confidence,
             trades=stage3.trades,
             total_cost=total_cost,
@@ -683,7 +692,7 @@ class WeatherCouncil:
 
         logger.info(
             "council_done", event_date=event_date_iso,
-            predicted_high=result.predicted_high_f,
+            predicted_temp=result.predicted_temp_f,
             n_trades=len(result.trades),
             confidence=result.confidence, total_cost=round(total_cost, 5),
         )
@@ -699,7 +708,7 @@ class WeatherCouncil:
             parts.append(
                 f"[{a.label} / {a.model}] "
                 + (f"ERROR: {a.error}" if a.error
-                   else f"predicted_high={a.predicted_high_f}°F conf={a.confidence}\n"
+                   else f"predicted_temp={a.predicted_temp_f}°F conf={a.confidence}\n"
                         f"{_trades_text(a.trades)}")
             )
         parts.append("\n### STAGE 2 — PEER REVIEW")
@@ -707,7 +716,7 @@ class WeatherCouncil:
             parts.append(
                 f"[{r.label} / {r.model}] "
                 + (f"ERROR: {r.error}" if r.error
-                   else f"updated_high={r.updated_predicted_high_f}°F\n"
+                   else f"updated_temp={r.updated_predicted_temp_f}°F\n"
                         f"{_trades_text(r.updated_trades)}\n"
                         f"agreements: {r.agreements}\n"
                         f"disagreements: {r.disagreements}")
@@ -716,7 +725,7 @@ class WeatherCouncil:
         parts.append(
             f"[{stage3.model}] "
             + (f"ERROR: {stage3.error}" if stage3.error
-               else f"final predicted_high={stage3.predicted_high_f}°F conf={stage3.confidence}\n"
+               else f"final predicted_temp={stage3.predicted_temp_f}°F conf={stage3.confidence}\n"
                     f"{_trades_text(stage3.trades)}\n"
                     f"dissent: {stage3.dissent_summary}\n"
                     f"risk_factors: {stage3.risk_factors}\n{stage3.overall_reasoning}")
@@ -732,7 +741,7 @@ def _stage1_blob(a: Stage1Answer) -> str:
     if a.error:
         return a.error
     return (
-        f"PREDICTED HIGH: {a.predicted_high_f}°F (confidence {a.confidence})\n"
+        f"PREDICTED TEMP: {a.predicted_temp_f}°F (confidence {a.confidence})\n"
         f"TRADES:\n{_trades_text(a.trades)}"
     )
 
@@ -741,7 +750,7 @@ def _stage2_blob(r: Stage2Review) -> str:
     if r.error:
         return r.error
     return (
-        f"UPDATED PREDICTED HIGH: {r.updated_predicted_high_f}°F\n"
+        f"UPDATED PREDICTED TEMP: {r.updated_predicted_temp_f}°F\n"
         f"UPDATED TRADES:\n{_trades_text(r.updated_trades)}\n"
         f"AGREEMENTS: {r.agreements}\n"
         f"DISAGREEMENTS: {r.disagreements}"
@@ -794,15 +803,18 @@ def persist_event_decision(
 
             row = CouncilDecision(
                 council_run_id=run_id,
+                event_ticker=event_data.get("event_ticker"),
+                city=event_data.get("city"),
+                temp_type=event_data.get("temp_type"),
                 ticker=trade.ticker,
                 market_title=bracket.get("title") or bracket.get("threshold") or trade.ticker,
-                predicted_high_f=_num(result.predicted_high_f),
-                stage1_model_a_predicted_high=_num(a1.predicted_high_f) if a1 else None,
-                stage1_model_b_predicted_high=_num(b1.predicted_high_f) if b1 else None,
-                stage1_model_c_predicted_high=_num(c1.predicted_high_f) if c1 else None,
-                stage2_model_a_updated_high=_num(a2.updated_predicted_high_f) if a2 else None,
-                stage2_model_b_updated_high=_num(b2.updated_predicted_high_f) if b2 else None,
-                stage2_model_c_updated_high=_num(c2.updated_predicted_high_f) if c2 else None,
+                predicted_temp_f=_num(result.predicted_temp_f),
+                stage1_model_a_predicted_temp=_num(a1.predicted_temp_f) if a1 else None,
+                stage1_model_b_predicted_temp=_num(b1.predicted_temp_f) if b1 else None,
+                stage1_model_c_predicted_temp=_num(c1.predicted_temp_f) if c1 else None,
+                stage2_model_a_updated_temp=_num(a2.updated_predicted_temp_f) if a2 else None,
+                stage2_model_b_updated_temp=_num(b2.updated_predicted_temp_f) if b2 else None,
+                stage2_model_c_updated_temp=_num(c2.updated_predicted_temp_f) if c2 else None,
                 stage1_model_a_reasoning=_stage1_blob(a1) if a1 else None,
                 stage1_model_b_reasoning=_stage1_blob(b1) if b1 else None,
                 stage1_model_c_reasoning=_stage1_blob(c1) if c1 else None,

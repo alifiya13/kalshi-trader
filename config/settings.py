@@ -13,7 +13,6 @@ Dual-mode credentials:
     has no real liquidity or volume data.
 """
 
-from decimal import Decimal
 from pathlib import Path
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
@@ -46,14 +45,6 @@ class Settings(BaseSettings):
     # --- Database ---
     database_url: str = "sqlite:///kalshi_trader.db"
 
-    # --- Risk ---
-    max_position_pct: Decimal = Decimal("0.02")
-    daily_loss_limit_pct: Decimal = Decimal("0.05")
-    weekly_loss_limit_pct: Decimal = Decimal("0.10")
-    max_category_exposure_pct: Decimal = Decimal("0.30")
-    kelly_fraction: Decimal = Decimal("0.25")
-    min_edge_to_trade: Decimal = Decimal("0.05")
-
     # --- LLM Gateway (OpenAI-compatible) ---
     llm_gateway_api_key: str = ""
     llm_gateway_base_url: str = "https://api.llmgateway.io/v1"
@@ -61,10 +52,6 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
     log_file: str = "logs/trader.log"
-
-    # --- Telegram alerts ---
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

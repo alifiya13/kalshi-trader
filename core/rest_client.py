@@ -277,6 +277,24 @@ class KalshiClient:
         """Fetch event info."""
         return self._request("GET", f"/events/{ticker}", authenticated=False)
 
+    def get_events(
+        self,
+        status: str | None = "open",
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> dict:
+        """
+        Fetch a page of events. NOTE: the API's `category` query param is
+        silently ignored (verified 2026-06-06) — filter on each event's
+        `category` FIELD client-side instead.
+        """
+        params = {"limit": limit}
+        if status:
+            params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
+        return self._request("GET", "/events", params=params, authenticated=False)
+
     def get_trades(self, ticker: str | None = None, limit: int = 100) -> dict:
         """Fetch public trades."""
         params = {"limit": limit}

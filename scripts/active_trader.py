@@ -9,23 +9,26 @@ money-making bot. Every council decision results in a paper
 trade so we can measure how well the council predicts.
 
 Runs continuously:
-  - Every 30 minutes: scan the weather EVENT (tomorrow's NYC
-    high), run the council ONCE over ALL brackets, paper-trade
-    every trade the council names
+  - Every 30 minutes: DISCOVER all open Kalshi weather events
+    (category "Climate and Weather" — no hardcoded tickers,
+    cities, or coordinates), filter to temperature events
+    closing before the study deadline, and run the council
+    ONCE on each event not yet decided
   - Every 30 seconds: update prices + evaluate exits
   - Prints live status table to terminal
 
-The market model is EVENT-level: KXHIGHNY-26JUN06 is one event
-with 6-8 mutually exclusive temperature brackets under it. The
-council sees the full bracket table in one context packet,
-predicts the high temperature, and MUST name at least one trade
-— skipping is not an option (research mandate).
+Per event, the council sees the full bracket table + that
+city's forecast (geocoded via Nominatim, ensembles via
+Open-Meteo, official forecast via NWS), predicts the
+temperature, and MUST name at least one trade — skipping is
+not an option (research mandate).
 
 There are NO trading gates. No edge threshold, no confidence
 floor, no risk engine. The council's decision IS the decision —
 that's the experiment. The only limits are cost controls:
-  - $1/day cap on LLM spend
-  - 30-minute interval between council scans
+  - $2/day cap on LLM spend (many cities now)
+  - 30-minute interval between scans
+  - each event is decided at most once (dedup by event_ticker)
 
 Ctrl+C to stop gracefully.
 
@@ -44,6 +47,7 @@ import argparse
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -66,24 +70,18 @@ from rich.table import Table
 from rich import box
 
 from core.rest_client import get_data_client, get_trade_client
-from data.db import Position, get_session, init_db
+from data.db import CouncilDecision, Position, get_session, init_db
+from data.weather_discovery import DEADLINE_UTC, discover_weather_events
 from execution.position_manager import PositionManager, ExitAction
 from agents.council import WeatherCouncil, persist_event_decision
-from strategies.weather import get_weather_context, get_weather_event_with_brackets
+from strategies.weather import get_weather_context
 from scripts.settle_council import settle_council_decisions
-from monitoring.telegram_bot import (
-    alert_startup,
-    alert_new_position,
-    alert_exit,
-    alert_scan_summary,
-    alert_error,
-)
 from config.settings import settings as _settings
 
 console = Console(width=140)
 
 # Loop cadence
-SCAN_INTERVAL = 1800  # 30 minutes between council scans (cost control)
+SCAN_INTERVAL = 1800  # 30 minutes between discovery+council scans
 PRICE_INTERVAL = 30   # 30 seconds between price updates
 
 # Fixed paper-trade size. This is a research project about council
@@ -92,8 +90,9 @@ PRICE_INTERVAL = 30   # 30 seconds between price updates
 PAPER_CONTRACTS = 10
 
 # --- Council cost control (budget protection, NOT a trading gate) ---
-# Council calls 7 LLMs per run (3 + 3 + 1 chairman), ~$0.016/run.
-COUNCIL_DAILY_COST_CAP = 1.00   # USD — stop running the council past this/day
+# Council calls 7 LLMs per run (3 + 3 + 1 chairman), ~$0.018/run. With
+# ~40 temperature events/day across all cities, a full sweep is ~$0.75.
+COUNCIL_DAILY_COST_CAP = 2.00   # USD — stop running the council past this/day
 
 _council_cost_day: str = ""     # UTC date str for the current cost window
 _council_cost_today: float = 0.0  # USD spent on councils in _council_cost_day
@@ -122,104 +121,158 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 
 # ----------------------------------------------------------------------
-# Main scan — ONE council run over the whole event; its decision IS the
-# decision
+# Dedup — events the council has already decided
 # ----------------------------------------------------------------------
 
-def scan_for_opportunities(client, pm: PositionManager, dry_run: bool) -> dict:
+def _decided_event_tickers() -> set[str]:
+    """Event tickers that already have council_decisions rows."""
+    session = get_session()
+    try:
+        rows = (
+            session.query(CouncilDecision.event_ticker)
+            .filter(CouncilDecision.event_ticker.isnot(None))
+            .distinct()
+            .all()
+        )
+        return {r[0] for r in rows}
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# Main scan — discover events, one council run per undecided event
+# ----------------------------------------------------------------------
+
+def scan_for_opportunities(
+    client, pm: PositionManager, dry_run: bool,
+    keep_going: Callable[[], bool] = lambda: True,
+) -> dict:
+    """
+    One full discovery + council sweep. `keep_going` is checked between
+    events so SIGTERM / --duration can stop a long multi-city sweep
+    mid-way without losing the decisions already made.
+    """
     global _council_cost_today
 
-    empty = {"entries": [], "num_markets": 0, "num_signals": 0, "council_runs": 0}
+    stats = {
+        "entries": [], "events_discovered": 0, "events_in_window": 0,
+        "events_already_decided": 0, "council_runs": 0, "scan_cost": 0.0,
+    }
 
-    # 1. Event-level fetch: tomorrow's NYC high with ALL its brackets
-    event = get_weather_event_with_brackets(client)
-    if not event:
-        console.print("[dim]  No active weather event found[/]")
-        return empty
+    # 1. Discover ALL open weather events (category-driven, nothing hardcoded)
+    try:
+        events = discover_weather_events(client)
+    except Exception as e:
+        console.print(f"[yellow]  Discovery failed: {e}[/]")
+        return stats
+    stats["events_discovered"] = len(events)
 
-    brackets = event["brackets"]
+    # 2./3. Temperature events only (we can only forecast temperature), with
+    # brackets inside the study deadline (discovery already dropped brackets
+    # past DEADLINE_UTC; events with none left were dropped there too).
+    tradeable = [ev for ev in events if ev.temp_type in ("high", "low")]
+    stats["events_in_window"] = len(tradeable)
+
+    # 4. Skip events the council already decided (one decision per event).
+    decided = _decided_event_tickers()
+    todo = [ev for ev in tradeable if ev.event_ticker not in decided]
+    stats["events_already_decided"] = len(tradeable) - len(todo)
+
     console.print(
-        f"[dim]  Event: {event['series_ticker']} {event['event_date']} — "
-        f"{len(brackets)} bracket(s): "
-        + ", ".join(b["threshold"] for b in brackets) + "[/]"
+        f"[dim]  Discovered {len(events)} weather event(s) | "
+        f"temperature & in-window: {len(tradeable)} | "
+        f"already decided: {stats['events_already_decided']} | "
+        f"to run: {len(todo)} (deadline {DEADLINE_UTC:%Y-%m-%d %H:%M} UTC)[/]"
     )
 
     _reset_council_budget_if_new_day()
-    if _council_cost_today >= COUNCIL_DAILY_COST_CAP:
-        console.print(
-            f"[yellow]  Council skipped: daily cap hit "
-            f"(${_council_cost_today:.4f} ≥ ${COUNCIL_DAILY_COST_CAP:.2f})[/]"
-        )
-        return empty
-
-    # 2. Weather context (ensembles + NWS), fetched once for the event
-    try:
-        weather_ctx = get_weather_context(target_date=event["event_date"])
-    except Exception as e:
-        console.print(f"[yellow]  Weather context failed: {e}[/]")
-        return empty
-
-    # 3. ONE council run sees the full bracket table and must name ≥1
-    #    trade. No edge gate, no confidence gate, no risk engine — every
-    #    trade it names is logged and paper-traded.
-    try:
-        result = WeatherCouncil().run_council(weather_ctx, event)
-    except Exception as e:
-        console.print(f"[yellow]  Council error: {e}[/]")
-        return empty
-    _council_cost_today += result.total_cost
-
-    # One council_decisions row per trade, grouped by council_run_id.
-    row_ids = persist_event_decision(result, event, weather_ctx.get("nws_high"))
-
-    conf = result.confidence or 0.0
-    console.print(
-        f"  [cyan]council[/] predicted_high={result.predicted_high_f}°F "
-        f"conf={conf:.2f}  {len(result.trades)} trade(s)  "
-        f"cost=${result.total_cost:.4f} "
-        f"(today=${_council_cost_today:.4f}/${COUNCIL_DAILY_COST_CAP:.2f})  "
-        f"logged {len(row_ids)} decision row(s)"
-    )
-
-    # 4. Paper-trade every trade the council named.
-    bracket_by_ticker = {b["ticker"]: b for b in brackets}
     existing = {p.ticker for p in pm.positions if p.status == "open"}
-    entries: list[dict] = []
 
-    for trade in result.trades:
-        bracket = bracket_by_ticker[trade.ticker]  # tickers pre-validated by the council
+    # 5. One council run per remaining event.
+    for ev in todo:
+        if not keep_going():
+            console.print("[yellow]  Scan interrupted — stopping sweep[/]")
+            break
+        if _council_cost_today >= COUNCIL_DAILY_COST_CAP:
+            console.print(
+                f"[yellow]  Council stopped: daily cap hit "
+                f"(${_council_cost_today:.4f} ≥ ${COUNCIL_DAILY_COST_CAP:.2f})[/]"
+            )
+            break
+
         console.print(
-            f"  [cyan]trade[/] {trade.ticker} [{bracket['threshold']}]: "
-            f"{trade.side.upper()}  P(win)={trade.probability}"
+            f"\n  [bold]{ev.event_ticker}[/] — {ev.city} {ev.temp_type} "
+            f"on {ev.event_date}  ({len(ev.brackets)} brackets, "
+            f"lat={ev.lat:.3f} lon={ev.lon:.3f})"
         )
-        if trade.ticker in existing:
-            console.print(f"    [dim]already holding — position not duplicated[/]")
+
+        # a. Forecast for this city/day/variable
+        try:
+            weather_ctx = get_weather_context(
+                latitude=ev.lat, longitude=ev.lon,
+                target_date=ev.event_date, temp_type=ev.temp_type,
+                city=ev.city,
+            )
+        except Exception as e:
+            console.print(f"  [yellow]weather context failed: {e}[/]")
+            continue
+        if not weather_ctx.get("n_members"):
+            console.print("  [yellow]no ensemble members for this date — skipped[/]")
             continue
 
-        entry_price = bracket["yes_price"] if trade.side == "yes" else bracket["no_price"]
-        if entry_price <= 0 or entry_price >= 1:
-            console.print(f"    [dim]unpriceable ({trade.side} @ ${entry_price}) — no position[/]")
+        # b./c. Council sees all brackets + forecast, must name ≥1 trade
+        event_data = ev.as_council_event()
+        try:
+            result = WeatherCouncil().run_council(weather_ctx, event_data)
+        except Exception as e:
+            console.print(f"  [yellow]council error: {e}[/]")
             continue
+        stats["council_runs"] += 1
+        stats["scan_cost"] += result.total_cost
+        _council_cost_today += result.total_cost
 
-        edge = (
-            Decimal(str(trade.probability)) - entry_price
-            if trade.probability is not None else Decimal("0")
-        )
-        entry = _record_entry(
-            pm, trade.ticker, trade.side, entry_price,
-            PAPER_CONTRACTS, "weather_council", dry_run,
-            edge=edge,
-        )
-        if entry:
-            entries.append(entry)
-            existing.add(trade.ticker)
+        row_ids = persist_event_decision(result, event_data, weather_ctx.get("nws_temp"))
 
-    return {
-        "entries": entries,
-        "num_markets": len(brackets),
-        "num_signals": len(result.trades),
-        "council_runs": 1,
-    }
+        conf = result.confidence or 0.0
+        console.print(
+            f"  [cyan]council[/] predicted_{ev.temp_type}={result.predicted_temp_f}°F "
+            f"(NWS {weather_ctx.get('nws_temp')}°F, ens {weather_ctx.get('ensemble_mean')}°F) "
+            f"conf={conf:.2f}  {len(result.trades)} trade(s)  "
+            f"cost=${result.total_cost:.4f} "
+            f"(today=${_council_cost_today:.4f}/${COUNCIL_DAILY_COST_CAP:.2f})  "
+            f"rows={row_ids}"
+        )
+
+        # d. Paper-trade every trade the council named.
+        bracket_by_ticker = {b["ticker"]: b for b in ev.brackets}
+        for trade in result.trades:
+            bracket = bracket_by_ticker[trade.ticker]  # tickers pre-validated
+            console.print(
+                f"  [cyan]trade[/] {trade.ticker} [{bracket['threshold']}]: "
+                f"{trade.side.upper()}  P(win)={trade.probability}"
+            )
+            if trade.ticker in existing:
+                console.print("    [dim]already holding — position not duplicated[/]")
+                continue
+
+            entry_price = bracket["yes_price"] if trade.side == "yes" else bracket["no_price"]
+            if entry_price <= 0 or entry_price >= 1:
+                console.print(f"    [dim]unpriceable ({trade.side} @ ${entry_price}) — no position[/]")
+                continue
+
+            edge = (
+                Decimal(str(trade.probability)) - entry_price
+                if trade.probability is not None else Decimal("0")
+            )
+            entry = _record_entry(
+                pm, trade.ticker, trade.side, entry_price,
+                PAPER_CONTRACTS, "weather_council", dry_run, edge=edge,
+            )
+            if entry:
+                stats["entries"].append(entry)
+                existing.add(trade.ticker)
+
+    return stats
 
 
 def _record_entry(
@@ -243,13 +296,9 @@ def _record_entry(
 
         cost = entry_price * contracts
         console.print(
-            f"  [green]{'[DRY] ' if dry_run else ''}NEW[/] {ticker}  "
+            f"    [green]{'[DRY] ' if dry_run else ''}NEW[/] {ticker}  "
             f"{side.upper()} x{contracts} @ ${entry_price:.2f}  "
-            f"cost=${cost:.2f}  strategy={strategy}"
-        )
-        alert_new_position(
-            ticker=ticker, side=side, contracts=contracts,
-            entry_price=entry_price, cost=cost, strategy=strategy, edge=edge,
+            f"cost=${cost:.2f}  edge={float(edge):+.3f}"
         )
         return {
             "ticker": ticker, "side": side, "entry_price": entry_price,
@@ -257,7 +306,7 @@ def _record_entry(
         }
     except Exception as e:
         session.rollback()
-        console.print(f"[red]  Entry failed: {e}[/]")
+        console.print(f"[red]    Entry failed: {e}[/]")
         return None
     finally:
         session.close()
@@ -337,26 +386,22 @@ def main():
     pm = PositionManager(data_client, dry_run=dry_run)
     pm.load_open_positions()
     console.print(f"[dim]Loaded {len(pm.positions)} existing position(s)[/]")
-
-    balance = Decimal("100.00")
-    if not dry_run:
-        try:
-            resp = trade_client.get_balance()
-            balance = resp.get("balance", Decimal("100"))
-            if not isinstance(balance, Decimal):
-                balance = Decimal(str(balance))
-        except Exception:
-            pass
-    console.print(f"[dim]Balance: ${balance:,.2f}  |  Research mode: every council decision is paper-traded[/]")
+    console.print(f"[dim]Research mode: every council decision is paper-traded. "
+                  f"Study deadline: {DEADLINE_UTC:%Y-%m-%d %H:%M} UTC[/]")
     console.print()
-
-    alert_startup(env=_settings.kalshi_env + (" (dry-run)" if dry_run else " (live)"), balance=balance)
 
     global _running
     start_time = time.time()
     cycle = 0
     last_scan = 0.0
     last_price = 0.0
+
+    def keep_going() -> bool:
+        if not _running:
+            return False
+        if args.duration > 0 and (time.time() - start_time) >= args.duration:
+            return False
+        return True
 
     try:
         while _running:
@@ -367,20 +412,21 @@ def main():
                 console.print(f"\n[yellow]Duration limit ({args.duration}s) reached. Stopping.[/]")
                 break
 
-            # --- Scan: run the council on the weather event's brackets ---
+            # --- Discovery + council sweep ---
             if now - last_scan >= SCAN_INTERVAL or last_scan == 0:
                 console.print(f"\n[bold cyan]--- Scan #{cycle} @ {datetime.now().strftime('%H:%M:%S')} ---[/]")
-                scan_stats = {"entries": [], "num_markets": 0, "num_signals": 0}
                 try:
-                    scan_stats = scan_for_opportunities(data_client, pm, dry_run)
-                    new_entries = scan_stats["entries"]
-                    if new_entries:
-                        console.print(f"  [green]Entered {len(new_entries)} new position(s)[/]")
-                    else:
-                        console.print(f"  [dim]No new positions this scan[/]")
+                    s = scan_for_opportunities(data_client, pm, dry_run, keep_going)
+                    console.print(
+                        f"\n  [bold]Scan summary:[/] discovered={s['events_discovered']} "
+                        f"in_window={s['events_in_window']} "
+                        f"already_decided={s['events_already_decided']} "
+                        f"council_runs={s['council_runs']} "
+                        f"paper_trades={len(s['entries'])} "
+                        f"scan_cost=${s['scan_cost']:.4f}"
+                    )
                 except Exception as e:
                     console.print(f"  [red]Scan error: {e}[/]")
-                    alert_error(f"Scan error: {e}")
                 last_scan = now
 
                 # Settlement check — reconcile council decisions + positions
@@ -396,12 +442,6 @@ def main():
                     console.print(f"  [yellow]Settlement check failed: {e}[/]")
 
                 pm.load_open_positions()
-                alert_scan_summary(
-                    num_markets=scan_stats["num_markets"],
-                    num_signals=scan_stats["num_signals"],
-                    num_trades=len(scan_stats["entries"]),
-                    balance=balance,
-                )
 
             # --- Price updates + exit evaluation ---
             if now - last_price >= PRICE_INTERVAL or last_price == 0:
@@ -419,10 +459,6 @@ def main():
                             f"${pos.entry_price:.2f}→${pos.current_price:.2f}  "
                             f"pnl=${float(pnl):+.2f}"
                         )
-                        alert_exit(
-                            ticker=pos.ticker, side=pos.side,
-                            exit_price=pos.current_price, pnl=pnl, reason=label,
-                        )
 
                 last_price = now
 
@@ -431,10 +467,11 @@ def main():
             # Sleep, checking _running frequently for responsiveness
             sleep_until = now + PRICE_INTERVAL
             while _running and time.time() < sleep_until:
+                if args.duration > 0 and (time.time() - start_time) >= args.duration:
+                    break
                 time.sleep(1)
     except Exception as e:
         console.print(f"[red]Fatal error: {e}[/]")
-        alert_error(f"Fatal error: {e}")
         raise
 
     console.print("\n[bold yellow]Active trader stopped.[/]")
@@ -451,12 +488,27 @@ def main():
         total_pnl = session.query(func.sum(Position.realized_pnl)).filter(
             Position.status.in_(["closed_profit", "closed_loss", "settled"])
         ).scalar() or 0
+        decisions = session.query(CouncilDecision).count()
+        runs = session.query(CouncilDecision.council_run_id).distinct().count()
+        cost = session.query(func.sum(CouncilDecision.total_cost_usd)).scalar()
 
         console.print(f"\n[bold]Session Summary:[/]")
+        console.print(f"  Council runs (events decided): {runs}")
+        console.print(f"  Decision rows (trades named):  {decisions}")
         console.print(f"  Total positions: {total}")
         console.print(f"  Still open:      {open_pos}")
         console.print(f"  Closed:          {closed}")
         console.print(f"  Realized P&L:    ${float(total_pnl):+.2f}")
+        if cost is not None:
+            # total_cost_usd is per-run, duplicated across that run's rows —
+            # sum of per-run costs needs the distinct run ids.
+            run_costs = (
+                session.query(CouncilDecision.council_run_id,
+                              func.max(CouncilDecision.total_cost_usd))
+                .group_by(CouncilDecision.council_run_id).all()
+            )
+            llm_total = sum(float(c or 0) for _, c in run_costs)
+            console.print(f"  Total LLM cost:  ${llm_total:.4f}")
     finally:
         session.close()
 
