@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
 =============================================================
-  ACTIVE TRADER — Continuous trading engine (weather-only)
+  ACTIVE TRADER — LLM-council research engine (weather-only)
 =============================================================
 
+This is a RESEARCH project about council accuracy, not a
+money-making bot. Every council decision results in a paper
+trade so we can measure how well the council predicts.
+
 Runs continuously:
-  - Every 5 minutes: scan for new weather opportunities
+  - Every 30 minutes: scan the weather EVENT (tomorrow's NYC
+    high), run the council on each bracket, paper-trade every
+    bracket the council says to trade
   - Every 30 seconds: update prices + evaluate exits
   - Prints live status table to terminal
 
-Scanning is TARGETED: we hit the KXHIGHNY weather series directly
-via `get_markets(series_ticker=...)` instead of paginating through
-the entire prod catalog (which is dominated by zero-volume
-parlay permutations).
+The market model is EVENT-level: KXHIGHNY-26JUN06 is one event
+with 6-8 mutually exclusive temperature brackets under it. The
+council sees the full bracket picture and decides per bracket.
 
-Every entry candidate is gated by the single RiskEngine
-(execution/risk_engine.py). No strategy does its own sizing.
+There are NO trading gates. No edge threshold, no confidence
+floor, no risk engine. The council's decision IS the decision —
+that's the experiment. The only limits are cost controls:
+  - $1/day cap on LLM spend
+  - 30-minute interval between council scans
 
 Ctrl+C to stop gracefully.
 
@@ -34,6 +42,7 @@ import argparse
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -58,9 +67,8 @@ from rich import box
 from core.rest_client import get_data_client, get_trade_client
 from data.db import Position, get_session, init_db
 from execution.position_manager import PositionManager, ExitAction
-from execution.risk_engine import RiskEngine, TradeSignal
-from agents.council import WeatherCouncil, persist_council_decision
-from strategies.weather import get_weather_context, parse_ticker_date
+from agents.council import WeatherCouncil, CouncilResult, persist_council_decision
+from strategies.weather import get_weather_context, get_weather_event_with_brackets
 from scripts.settle_council import settle_council_decisions
 from monitoring.telegram_bot import (
     alert_startup,
@@ -73,30 +81,18 @@ from config.settings import settings as _settings
 
 console = Console(width=140)
 
-# --- Scanning targets ---
-# Weather-only. We pull this series directly and feed it into the weather
-# strategy. Every candidate still passes the single RiskEngine gate.
-TARGETED_SERIES: tuple[str, ...] = (
-    "KXHIGHNY",       # NYC daily high — weather_v1 strategy
-)
-
 # Loop cadence
-SCAN_INTERVAL = 300   # 5 minutes between opportunity scans
+SCAN_INTERVAL = 1800  # 30 minutes between council scans (cost control)
 PRICE_INTERVAL = 30   # 30 seconds between price updates
 
-# --- Combined weather + council decision gate ---
-# BOTH the weather model AND the LLM council must agree before we paper-trade:
-#   1. weather edge >= 15¢            (strong conviction from the ensemble model)
-#   2. council says should_trade=true (the 3-stage LLM council agrees)
-#   3. council confidence > 0.6       (the council is reasonably sure)
-COMBINED_MIN_EDGE = Decimal("0.15")
-COUNCIL_MIN_CONFIDENCE = 0.6
+# Fixed paper-trade size. This is a research project about council
+# accuracy — sizing is irrelevant, so every trade is the same size to
+# keep the P&L series interpretable.
+PAPER_CONTRACTS = 10
 
-# --- Council cost control ---
-# Council calls 7 LLMs per run (3 + 3 + 1 chairman), ~$0.016/run. Cap how
-# much we spend per scan cycle and per UTC day.
-MAX_COUNCIL_RUNS_PER_SCAN = 3
-COUNCIL_DAILY_COST_CAP = 0.50   # USD — stop running the council past this/day
+# --- Council cost control (budget protection, NOT a trading gate) ---
+# Council calls 7 LLMs per run (3 + 3 + 1 chairman), ~$0.016/run.
+COUNCIL_DAILY_COST_CAP = 1.00   # USD — stop running the council past this/day
 
 _council_cost_day: str = ""     # UTC date str for the current cost window
 _council_cost_today: float = 0.0  # USD spent on councils in _council_cost_day
@@ -125,101 +121,15 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 
 # ----------------------------------------------------------------------
-# Targeted market fetch
-# ----------------------------------------------------------------------
-
-def _fetch_series_markets(client, series_ticker: str) -> list[dict]:
-    """Pull every open market for a specific series in one call."""
-    try:
-        resp = client.get_markets(series_ticker=series_ticker, status="open", limit=200)
-        markets = resp.get("markets", [])
-        # Paginate if there's a cursor (rare for a single series, but some have
-        # enough strikes to exceed 200).
-        cursor = resp.get("cursor")
-        while cursor:
-            resp = client.get_markets(
-                series_ticker=series_ticker, status="open", limit=200, cursor=cursor,
-            )
-            markets.extend(resp.get("markets", []))
-            cursor = resp.get("cursor")
-        return markets
-    except Exception as e:
-        console.print(f"[yellow]  Fetch {series_ticker} failed: {e}[/]")
-        return []
-
-
-# ----------------------------------------------------------------------
-# Weather scanner — returns a list of TradeSignal + extra context
-# ----------------------------------------------------------------------
-
-def _weather_signals(client, weather_markets: list[dict]) -> list[dict]:
-    """
-    Run the weather strategy against an already-fetched KXHIGHNY market
-    list. We pass the client to reuse the existing weather pipeline
-    (ensemble + NWS), but the market filter is already targeted.
-    """
-    try:
-        from strategies.weather import find_weather_edge
-        signals = find_weather_edge(client, min_edge=Decimal("0.03"))
-    except Exception as e:
-        console.print(f"[yellow]  Weather scan error: {e}[/]")
-        return []
-
-    _CONF_MAP = {"high": Decimal("0.80"), "medium": Decimal("0.60"), "low": Decimal("0.30")}
-
-    out: list[dict] = []
-    for s in signals:
-        if not s.tradeable:
-            continue
-        entry_price = s.market_yes_ask if s.side == "yes" else (Decimal("1") - s.market_yes_bid)
-        if entry_price <= 0 or entry_price >= 1:
-            continue
-        confidence = _CONF_MAP.get(s.confidence, Decimal("0.30"))
-        # Desired contracts: weather previously used its own Kelly. Now we hand
-        # the engine a generous target; the engine will clamp to the table cap.
-        desired = 20
-        out.append({
-            "signal": TradeSignal(
-                ticker=s.ticker,
-                side=s.side,
-                strategy="weather_v1",
-                edge=s.edge,
-                confidence=confidence,
-                cost_per_contract=entry_price,
-                desired_contracts=desired,
-                category="weather",
-            ),
-            "extra": {
-                "label": s.threshold_label,
-                "model_prob": float(s.model_prob),
-                "market_prob": float(s.market_prob),
-            },
-        })
-    return out
-
-
-# ----------------------------------------------------------------------
 # Market-data packet for the council
 # ----------------------------------------------------------------------
 
-def _build_market_data(bundle: dict, raw_market: dict | None) -> dict:
+def _build_market_data(bracket: dict) -> dict:
     """
-    Assemble the live-market half of the council's context packet from a
-    weather signal bundle (+ the raw Kalshi market dict for volume/close_time).
+    Assemble the live-market half of the council's context packet from
+    one bracket of the weather event.
     """
-    sig: TradeSignal = bundle["signal"]
-    extra = bundle.get("extra", {})
-
-    yes_ask = sig.cost_per_contract if sig.side == "yes" else None
-    # cost_per_contract is the entry price on the chosen side; reconstruct the
-    # raw YES/NO asks from the raw market when we have it.
-    yes_ask_raw = Decimal(str((raw_market or {}).get("yes_ask_dollars") or "0"))
-    yes_bid_raw = Decimal(str((raw_market or {}).get("yes_bid_dollars") or "0"))
-    yes_price = yes_ask_raw if yes_ask_raw > 0 else sig.cost_per_contract
-    no_price = (Decimal("1") - yes_bid_raw) if yes_bid_raw > 0 else (Decimal("1") - yes_price)
-    spread = (yes_ask_raw - yes_bid_raw) if (yes_ask_raw > 0 and yes_bid_raw > 0) else None
-
-    close_time = (raw_market or {}).get("close_time")
+    close_time = bracket.get("close_time")
     hours_to_settlement = None
     if close_time:
         try:
@@ -228,139 +138,141 @@ def _build_market_data(bundle: dict, raw_market: dict | None) -> dict:
         except (ValueError, AttributeError):
             pass
 
+    yes_ask = bracket["yes_price"]
+    yes_bid = bracket["yes_bid"]
+    spread = (yes_ask - yes_bid) if (yes_ask > 0 and yes_bid > 0) else None
+
     return {
-        "ticker": sig.ticker,
-        "title": (raw_market or {}).get("title") or extra.get("label") or sig.ticker,
-        "threshold_label": extra.get("label", ""),
-        "yes_price": yes_price,
-        "no_price": no_price,
+        "ticker": bracket["ticker"],
+        "title": bracket["title"] or bracket["threshold"],
+        "threshold_label": bracket["threshold"],
+        "yes_price": bracket["yes_price"],
+        "no_price": bracket["no_price"],
         "spread": spread,
-        "market_prob": extra.get("market_prob"),
-        "volume": (raw_market or {}).get("volume"),
+        "market_prob": float(bracket["market_prob"]),
+        "volume": bracket["volume"],
         "close_time": close_time,
         "hours_to_settlement": hours_to_settlement,
     }
 
 
+def _council_edge(result: CouncilResult, bracket: dict) -> Optional[Decimal]:
+    """
+    Edge implied by the council's own probability vs the entry cost on
+    the side it picked. Purely descriptive — logged for research, never
+    used to gate the trade.
+    """
+    if result.final_probability is None:
+        return None
+    p = Decimal(str(result.final_probability))
+    if result.side == "yes":
+        return p - bracket["yes_price"]
+    return (Decimal("1") - p) - bracket["no_price"]
+
+
 # ----------------------------------------------------------------------
-# Main scan — weather model + LLM council must AGREE, then RiskEngine sizes
+# Main scan — council runs on every bracket; its decision IS the decision
 # ----------------------------------------------------------------------
 
-def scan_for_opportunities(client, pm: PositionManager, dry_run: bool, balance: Decimal) -> dict:
+def scan_for_opportunities(client, pm: PositionManager, dry_run: bool) -> dict:
     global _council_cost_today
-    risk = RiskEngine(balance)
 
-    # 1. Targeted fetch — one API call for the weather series
-    weather_markets = _fetch_series_markets(client, "KXHIGHNY")
-    market_by_ticker = {m.get("ticker"): m for m in weather_markets}
-    num_markets = len(weather_markets)
-    console.print(f"[dim]  Targeted: weather={len(weather_markets)}[/]")
+    empty = {"entries": [], "num_markets": 0, "num_signals": 0, "council_runs": 0}
 
-    # 2. Build weather signals
-    weather_sigs = _weather_signals(client, weather_markets)
-    num_signals = len(weather_sigs)
-    console.print(f"[dim]  Signals: weather={len(weather_sigs)}[/]")
+    # 1. Event-level fetch: tomorrow's NYC high with ALL its brackets
+    event = get_weather_event_with_brackets(client)
+    if not event:
+        console.print("[dim]  No active weather event found[/]")
+        return empty
 
-    # 3. Council only runs on signals that ALREADY clear the 15¢ edge bar —
-    #    no point paying for 7 LLM calls on a market the weather model won't
-    #    back. Highest-edge candidates first.
-    candidates = sorted(
-        (b for b in weather_sigs if b["signal"].edge >= COMBINED_MIN_EDGE),
-        key=lambda b: b["signal"].edge, reverse=True,
-    )
+    brackets = event["brackets"]
     console.print(
-        f"[dim]  Council candidates (edge ≥ {COMBINED_MIN_EDGE}): {len(candidates)}[/]"
+        f"[dim]  Event: {event['series_ticker']} {event['event_date']} — "
+        f"{len(brackets)} bracket(s): "
+        + ", ".join(b["threshold"] for b in brackets) + "[/]"
     )
+
+    # 2. Weather context (ensembles + NWS), fetched once for the event
+    try:
+        weather_ctx = get_weather_context(target_date=event["event_date"])
+    except Exception as e:
+        console.print(f"[yellow]  Weather context failed: {e}[/]")
+        return empty
 
     council = WeatherCouncil()
     _reset_council_budget_if_new_day()
-    ctx_cache: dict = {}  # target_date -> weather context (built once per day)
 
     existing = {p.ticker for p in pm.positions if p.status == "open"}
     entries: list[dict] = []
     council_runs = 0
 
-    for bundle in candidates:
-        sig: TradeSignal = bundle["signal"]
-        if sig.ticker in existing:
+    # 3. Run the council on every bracket of the event. No edge gate, no
+    #    confidence gate, no risk engine — every decision is logged and
+    #    every should_trade=true becomes a paper trade. Only the daily
+    #    LLM budget can stop the loop.
+    for bracket in brackets:
+        ticker = bracket["ticker"]
+        if ticker in existing:
+            console.print(f"  [dim]{ticker}: already holding — skipped[/]")
             continue
-        if council_runs >= MAX_COUNCIL_RUNS_PER_SCAN:
-            console.print(f"[dim]  Council run cap reached ({MAX_COUNCIL_RUNS_PER_SCAN}/scan)[/]")
-            break
         if _council_cost_today >= COUNCIL_DAILY_COST_CAP:
             console.print(
-                f"[yellow]  Council skipped: daily cap hit "
+                f"[yellow]  Council stopped: daily cap hit "
                 f"(${_council_cost_today:.4f} ≥ ${COUNCIL_DAILY_COST_CAP:.2f})[/]"
             )
             break
 
-        # Weather context, cached per observation date.
-        target_date = parse_ticker_date(sig.ticker)
-        if target_date not in ctx_cache:
-            try:
-                ctx_cache[target_date] = get_weather_context(target_date=target_date)
-            except Exception as e:
-                console.print(f"[yellow]  Weather context failed for {sig.ticker}: {e}[/]")
-                continue
-        weather_ctx = ctx_cache[target_date]
+        market_data = _build_market_data(bracket)
 
-        market_data = _build_market_data(bundle, market_by_ticker.get(sig.ticker))
-
-        # --- Run the 3-stage council ---
         try:
             result = council.run_council(weather_ctx, market_data)
         except Exception as e:
-            console.print(f"[yellow]  Council error on {sig.ticker}: {e}[/]")
+            console.print(f"[yellow]  Council error on {ticker}: {e}[/]")
             continue
         council_runs += 1
         _council_cost_today += result.total_cost
 
+        edge = _council_edge(result, bracket)
+
         # Log EVERY council decision, trade or not (research audit trail).
         persist_council_decision(
             result,
-            market_yes_price=market_data["yes_price"],
-            market_no_price=market_data["no_price"],
-            edge=sig.edge,
+            market_yes_price=bracket["yes_price"],
+            market_no_price=bracket["no_price"],
+            edge=edge,
             weather_nws_high=weather_ctx.get("nws_high"),
         )
 
         conf = result.confidence or 0.0
         console.print(
-            f"  [cyan]council[/] {sig.ticker}: weather_edge={float(sig.edge):.3f} "
+            f"  [cyan]council[/] {ticker} [{bracket['threshold']}]: "
             f"final_prob={result.final_probability} should_trade={result.should_trade} "
-            f"conf={conf:.2f}  cost=${result.total_cost:.4f} "
+            f"side={result.side} conf={conf:.2f}  cost=${result.total_cost:.4f} "
             f"(today=${_council_cost_today:.4f}/${COUNCIL_DAILY_COST_CAP:.2f})"
         )
 
-        # --- Combined gate: weather AND council must agree ---
-        agree = (
-            sig.edge >= COMBINED_MIN_EDGE
-            and result.should_trade
-            and conf > COUNCIL_MIN_CONFIDENCE
-        )
-        if not agree:
-            console.print(f"  [dim]  no trade — council/weather did not both clear the bar[/]")
+        if not result.should_trade:
             continue
 
-        # --- RiskEngine sizes the (paper) position ---
-        decision = risk.check_can_trade(sig)
-        if not decision.allowed:
-            console.print(f"  [dim]skip {sig.ticker}: {decision.reason}[/]")
+        # --- Council said trade → paper trade, no second-guessing ---
+        entry_price = bracket["yes_price"] if result.side == "yes" else bracket["no_price"]
+        if entry_price <= 0 or entry_price >= 1:
+            console.print(f"  [dim]{ticker}: unpriceable ({result.side} @ ${entry_price}) — skipped[/]")
             continue
 
         entry = _record_entry(
-            pm, sig.ticker, sig.side, sig.cost_per_contract,
-            decision.approved_contracts, "weather_council", dry_run,
-            edge=sig.edge,
+            pm, ticker, result.side, entry_price,
+            PAPER_CONTRACTS, "weather_council", dry_run,
+            edge=edge or Decimal("0"),
         )
         if entry:
             entries.append(entry)
-            existing.add(sig.ticker)
+            existing.add(ticker)
 
     return {
         "entries": entries,
-        "num_markets": num_markets,
-        "num_signals": num_signals,
+        "num_markets": len(brackets),
+        "num_signals": council_runs,
         "council_runs": council_runs,
     }
 
@@ -490,7 +402,7 @@ def main():
                 balance = Decimal(str(balance))
         except Exception:
             pass
-    console.print(f"[dim]Balance: ${balance:,.2f}  |  Risk-gated via RiskEngine (blueprint v2)[/]")
+    console.print(f"[dim]Balance: ${balance:,.2f}  |  Research mode: every council decision is paper-traded[/]")
     console.print()
 
     alert_startup(env=_settings.kalshi_env + (" (dry-run)" if dry_run else " (live)"), balance=balance)
@@ -510,17 +422,17 @@ def main():
                 console.print(f"\n[yellow]Duration limit ({args.duration}s) reached. Stopping.[/]")
                 break
 
-            # --- Scan for new opportunities ---
+            # --- Scan: run the council on the weather event's brackets ---
             if now - last_scan >= SCAN_INTERVAL or last_scan == 0:
                 console.print(f"\n[bold cyan]--- Scan #{cycle} @ {datetime.now().strftime('%H:%M:%S')} ---[/]")
                 scan_stats = {"entries": [], "num_markets": 0, "num_signals": 0}
                 try:
-                    scan_stats = scan_for_opportunities(data_client, pm, dry_run, balance)
+                    scan_stats = scan_for_opportunities(data_client, pm, dry_run)
                     new_entries = scan_stats["entries"]
                     if new_entries:
                         console.print(f"  [green]Entered {len(new_entries)} new position(s)[/]")
                     else:
-                        console.print(f"  [dim]No new opportunities found[/]")
+                        console.print(f"  [dim]No new positions this scan[/]")
                 except Exception as e:
                     console.print(f"  [red]Scan error: {e}[/]")
                     alert_error(f"Scan error: {e}")

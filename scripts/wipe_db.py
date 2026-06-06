@@ -38,6 +38,7 @@ DELETE_ORDER = [
     "positions",
     "paper_trades",
     "debate_logs",
+    "council_decisions",
     "portfolio_snapshots",
 ]
 

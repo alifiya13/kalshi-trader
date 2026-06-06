@@ -670,6 +670,127 @@ def get_weather_context(
     }
 
 
+def get_weather_event_with_brackets(
+    client: KalshiClient,
+    target_date: Optional[date] = None,
+    series_ticker: str = "KXHIGHNY",
+) -> Optional[dict]:
+    """
+    Fetch ONE weather event (e.g. tomorrow's NYC high) with ALL of its
+    brackets, so the council can see the full picture at once.
+
+    A Kalshi "event" like KXHIGHNY-26JUN06 has 6-8 bracket markets under
+    it (B53.5, B61.5, ..., T54, T68) — each with its own YES/NO book.
+    Treating each bracket as an isolated market hides the structure: the
+    brackets are mutually exclusive and exactly one settles YES. This
+    returns them together, sorted by temperature.
+
+    Returns:
+        {
+            "event_date": date,
+            "series_ticker": "KXHIGHNY",
+            "brackets": [
+                {
+                    "ticker":       "KXHIGHNY-26JUN06-B63.5",
+                    "title":        "Will the high temp in NYC be 63-64° ...",
+                    "threshold":    "63-64°",          # human-readable range
+                    "type":         "band",            # "above" | "below" | "band"
+                    "floor_strike": 63,                # None for "below"
+                    "cap_strike":   64,                # None for "above"
+                    "yes_price":    Decimal,           # ask — cost to buy YES
+                    "no_price":     Decimal,           # cost to buy NO (1 - yes_bid)
+                    "yes_bid":      Decimal,
+                    "market_prob":  Decimal,           # bid/ask midpoint
+                    "volume":       int,
+                    "close_time":   str | None,
+                },
+                ...  # sorted coldest → warmest
+            ],
+        }
+    or None if no active brackets exist for the target date.
+    """
+    if target_date is None:
+        now_nyc = datetime.now(timezone(timedelta(hours=-4)))
+        target_date = (now_nyc + timedelta(days=1)).date()
+
+    # Pull every market in the series, paginating, then filter to the
+    # target date by TICKER date (close_time is off by one — see
+    # parse_ticker_date).
+    resp = client.get_markets(series_ticker=series_ticker, status="open", limit=200)
+    markets = resp.get("markets", [])
+    cursor = resp.get("cursor")
+    while cursor:
+        resp = client.get_markets(
+            series_ticker=series_ticker, status="open", limit=200, cursor=cursor,
+        )
+        markets.extend(resp.get("markets", []))
+        cursor = resp.get("cursor")
+
+    _TYPE_MAP = {"between": "band", "greater": "above", "less": "below"}
+
+    brackets: list[dict] = []
+    for m in markets:
+        if m.get("status") not in ("open", "active"):
+            continue
+        if parse_ticker_date(m.get("ticker", "")) != target_date:
+            continue
+
+        strike_type = m.get("strike_type", "")
+        floor_strike = m.get("floor_strike")
+        cap_strike = m.get("cap_strike")
+
+        if strike_type == "between":
+            threshold = f"{int(floor_strike)}-{int(cap_strike)}°"
+            sort_key = float(floor_strike)
+        elif strike_type == "greater":
+            threshold = f">{int(floor_strike)}°"
+            sort_key = float(floor_strike) + 0.5
+        elif strike_type == "less":
+            threshold = f"<{int(cap_strike)}°"
+            sort_key = float(cap_strike) - 99.0  # always coldest
+        else:
+            logger.warning("unknown_strike_type", ticker=m.get("ticker"),
+                           strike_type=strike_type)
+            continue
+
+        yes_bid = Decimal(str(m.get("yes_bid_dollars") or "0"))
+        yes_ask = Decimal(str(m.get("yes_ask_dollars") or "0"))
+        market_prob = _market_midpoint(yes_bid, yes_ask)
+        yes_price = yes_ask if yes_ask > 0 else market_prob
+        no_price = (Decimal("1") - yes_bid) if yes_bid > 0 else (Decimal("1") - market_prob)
+
+        brackets.append({
+            "ticker": m.get("ticker", ""),
+            "title": m.get("title", ""),
+            "threshold": threshold,
+            "type": _TYPE_MAP[strike_type],
+            "floor_strike": floor_strike,
+            "cap_strike": cap_strike,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "yes_bid": yes_bid,
+            "market_prob": market_prob,
+            "volume": m.get("volume") or 0,
+            "close_time": m.get("close_time"),
+            "_sort": sort_key,
+        })
+
+    if not brackets:
+        logger.warning("no_brackets_for_event", series=series_ticker,
+                       target_date=str(target_date))
+        return None
+
+    brackets.sort(key=lambda b: b.pop("_sort"))
+    logger.info("weather_event_assembled", series=series_ticker,
+                target_date=str(target_date), n_brackets=len(brackets))
+
+    return {
+        "event_date": target_date,
+        "series_ticker": series_ticker,
+        "brackets": brackets,
+    }
+
+
 def find_weather_edge(
     client: KalshiClient,
     series_ticker: str = "KXHIGHNY",
