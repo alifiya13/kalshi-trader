@@ -92,7 +92,7 @@ PAPER_CONTRACTS = 10
 # --- Council cost control (budget protection, NOT a trading gate) ---
 # Council calls 7 LLMs per run (3 + 3 + 1 chairman), ~$0.018/run. With
 # ~40 temperature events/day across all cities, a full sweep is ~$0.75.
-COUNCIL_DAILY_COST_CAP = 2.00   # USD — stop running the council past this/day
+COUNCIL_DAILY_COST_CAP = 5.00   # USD — stop running the council past this/day
 
 _council_cost_day: str = ""     # UTC date str for the current cost window
 _council_cost_today: float = 0.0  # USD spent on councils in _council_cost_day
