@@ -1,27 +1,34 @@
 """
-WeatherCouncil — a 3-stage LLM council for weather-market decisions.
+WeatherCouncil — a 3-stage LLM council for weather-EVENT decisions.
 
 Adapted from Andrej Karpathy's llm-council (github.com/karpathy/llm-council).
 We extract the PATTERN, not the code: three stages, anonymized peer review,
 a chairman that synthesizes. The plumbing (LLM Gateway client, JSON
 extraction, retry/cost logging) is our existing agents/base_agent.py.
 
+Event-level model (2026-06-06): the council runs ONCE per weather event and
+sees ALL brackets (B-bands + T-tails) with their YES/NO prices together. It
+predicts the high temperature and selects which brackets to trade. The
+chairman MUST select at least one trade — this is a research study measuring
+council accuracy, so "skip" is not a decision we can score.
+
     STAGE 1 — Independent Analysis
         Each council model receives the SAME context packet (ensemble +
-        NWS forecast + live Kalshi prices) and answers independently:
-        {probability, side, confidence, reasoning}.
+        NWS forecast + the FULL bracket table) and answers independently:
+        {predicted_high_f, confidence, trades: [{ticker, side, reasoning}]}.
 
     STAGE 2 — Peer Review
         Each model sees the WHOLE panel's Stage-1 answers, anonymized as
         "Model A / Model B / Model C" (it can't tell which is its own or
-        who wrote what), and may update its probability:
-        {updated_probability, agreements, disagreements, reasoning}.
+        who wrote what), and may update its prediction + trade selections:
+        {updated_predicted_high_f, updated_trades, agreements, disagreements}.
 
     STAGE 3 — Chairman Synthesis
         One stronger model sees every Stage-1 answer + every Stage-2 review
-        and produces the final call:
-        {final_probability, confidence, should_trade, side,
-         dissent_summary, reasoning, risk_factors}.
+        and produces the final call — at least one trade, each with a
+        win probability:
+        {predicted_high_f, confidence, trades: [{ticker, side, probability,
+         reasoning}], dissent_summary, risk_factors, overall_reasoning}.
 
 Design note: the A/B/C labels are STABLE across stages and map positionally
 to `council_models`, so the council_decisions table can store per-model
@@ -32,8 +39,9 @@ when a model errors out. Nothing is silently dropped.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -69,17 +77,17 @@ _LABELS = ("Model A", "Model B", "Model C", "Model D", "Model E")
 # Per-call generation knobs. Low temperature — we want calibrated estimates,
 # not creative writing. max_tokens is generous so the reasoning chain isn't
 # truncated mid-JSON (we log it all). Headroom matters because some models
-# (e.g. gemini-2.5-flash) spend tokens on internal "thinking" before the
-# JSON, and a truncated response fails to parse — costing us that model's
-# whole vote. We also ask models to keep reasoning concise (see prompts).
+# spend tokens on internal "thinking" before the JSON, and a truncated
+# response fails to parse — costing us that model's whole vote. We also ask
+# models to keep reasoning concise (see prompts).
 _TEMPERATURE = 0.3
 _MAX_TOKENS = 2800
 
 # Appended to every stage's instructions: keeps reasoning from ballooning
 # past the token budget (which truncates the JSON and loses the vote).
 _CONCISE = (
-    "\nKeep your reasoning concise — a few focused sentences, not an essay. "
-    "Output the JSON object and nothing else."
+    "\nKeep each reasoning field concise — a few focused sentences, not an "
+    "essay. Output the JSON object and nothing else."
 )
 
 
@@ -88,13 +96,21 @@ _CONCISE = (
 # ----------------------------------------------------------------------
 
 @dataclass
+class TradeCall:
+    """One bracket trade named by a council member or the chairman."""
+    ticker: str
+    side: str                          # "yes" | "no"
+    reasoning: str
+    probability: Optional[float] = None  # P(this trade WINS) — chairman only
+
+
+@dataclass
 class Stage1Answer:
     model: str
     label: str
-    probability: Optional[float]   # P(YES settles), 0..1
-    side: str                      # "yes" | "no"
-    confidence: Optional[float]    # 0..1
-    reasoning: str
+    predicted_high_f: Optional[float]  # the model's NYC daily-high prediction
+    confidence: Optional[float]        # 0..1
+    trades: list[TradeCall] = field(default_factory=list)
     raw_text: str = ""
     cost_usd: float = 0.0
     error: Optional[str] = None
@@ -104,10 +120,10 @@ class Stage1Answer:
 class Stage2Review:
     model: str
     label: str
-    updated_probability: Optional[float]
-    agreements: str
-    disagreements: str
-    reasoning: str
+    updated_predicted_high_f: Optional[float]
+    updated_trades: list[TradeCall] = field(default_factory=list)
+    agreements: str = ""
+    disagreements: str = ""
     raw_text: str = ""
     cost_usd: float = 0.0
     error: Optional[str] = None
@@ -116,32 +132,32 @@ class Stage2Review:
 @dataclass
 class Stage3Synthesis:
     model: str
-    final_probability: Optional[float]
+    predicted_high_f: Optional[float]
     confidence: Optional[float]
-    should_trade: bool
-    side: str
-    dissent_summary: str
-    reasoning: str
-    risk_factors: str
+    trades: list[TradeCall] = field(default_factory=list)  # ≥1, each with probability
+    dissent_summary: str = ""
+    risk_factors: str = ""
+    overall_reasoning: str = ""
     raw_text: str = ""
     cost_usd: float = 0.0
     error: Optional[str] = None
 
 
 @dataclass
-class CouncilResult:
-    ticker: str
-    market_title: str
+class CouncilEventResult:
+    """Full record of one council run over an entire weather event."""
+    event_date: str                    # ISO date of the observation day
+    series_ticker: str
     stage1_results: list[Stage1Answer]
     stage2_results: list[Stage2Review]
     stage3_result: Stage3Synthesis
 
-    final_probability: Optional[float]
-    side: str
-    should_trade: bool
+    # Chairman's final call, surfaced for convenience
+    predicted_high_f: Optional[float]
     confidence: Optional[float]
+    trades: list[TradeCall]            # the trades to paper-trade (≥1)
     total_cost: float
-    all_reasoning: str             # every stage's reasoning concatenated
+    all_reasoning: str                 # every stage's reasoning concatenated
 
     council_models: list[str] = field(default_factory=list)
     chairman_model: str = ""
@@ -155,8 +171,7 @@ def _to_float(v, default: Optional[float] = None) -> Optional[float]:
     try:
         if v is None or v == "":
             return default
-        f = float(v)
-        return f
+        return float(v)
     except (TypeError, ValueError):
         return default
 
@@ -189,12 +204,44 @@ def _as_text(v) -> str:
     return str(v)
 
 
-def _truthy(v) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    return str(v).strip().lower() in ("true", "yes", "1", "y", "trade")
+def _parse_trades(raw, valid_tickers: set[str], with_probability: bool = False) -> list[TradeCall]:
+    """
+    Coerce a model's `trades` list into TradeCall objects. Unknown tickers
+    (hallucinated or mangled) are dropped with a log line; duplicates keep
+    the first occurrence.
+    """
+    out: list[TradeCall] = []
+    seen: set[str] = set()
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for t in raw:
+        if not isinstance(t, dict):
+            continue
+        ticker = str(t.get("ticker") or "").strip().upper()
+        if ticker not in valid_tickers:
+            logger.warning("council_unknown_ticker", ticker=ticker)
+            continue
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        out.append(TradeCall(
+            ticker=ticker,
+            side=_norm_side(t.get("side")),
+            reasoning=_as_text(t.get("reasoning")),
+            probability=_clamp01(_to_float(t.get("probability"))) if with_probability else None,
+        ))
+    return out
+
+
+def _trades_text(trades: list[TradeCall]) -> str:
+    """Render a trade list as one readable line-per-trade block."""
+    if not trades:
+        return "(no trades named)"
+    lines = []
+    for t in trades:
+        prob = f" P(win)={t.probability}" if t.probability is not None else ""
+        lines.append(f"- {t.ticker} {t.side.upper()}{prob} — {t.reasoning}")
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------
@@ -203,11 +250,15 @@ def _truthy(v) -> bool:
 
 class WeatherCouncil:
     """
-    Run a 3-stage council on a single weather market.
+    Run a 3-stage council on a whole weather EVENT (all brackets at once).
 
     Usage:
         council = WeatherCouncil()
-        result = council.run_council(weather_data, market_data)
+        result = council.run_council(weather_data, event_data)
+
+    `event_data` is the dict from strategies.weather.get_weather_event_with_brackets:
+        {event_date, series_ticker, brackets: [{ticker, threshold, type,
+         yes_price, no_price, volume, ...}, ...]}
     """
 
     def __init__(
@@ -224,8 +275,27 @@ class WeatherCouncil:
     # Context packet — identical input to every Stage-1 model
     # ------------------------------------------------------------------
 
-    def _build_context(self, weather_data: dict, market_data: dict) -> str:
-        """Render the weather + market data into one plain-text packet."""
+    @staticmethod
+    def _bracket_table(event_data: dict) -> str:
+        """Render every bracket of the event as one aligned table."""
+        ev_date = event_data.get("event_date")
+        if isinstance(ev_date, date):
+            date_label = f"{ev_date:%b} {ev_date.day}, {ev_date.year}"
+        else:
+            date_label = str(ev_date)
+
+        lines = [f"Available brackets for NYC High Temperature on {date_label}:"]
+        for b in event_data.get("brackets", []):
+            suffix = b["ticker"].rsplit("-", 1)[-1]
+            lines.append(
+                f"  {suffix:<7} ({b['threshold']}F): "
+                f"YES ${float(b['yes_price']):.2f} / NO ${float(b['no_price']):.2f}"
+                f"   volume={b.get('volume', 0)}   ticker={b['ticker']}"
+            )
+        return "\n".join(lines)
+
+    def _build_context(self, weather_data: dict, event_data: dict) -> str:
+        """Render the weather + full-event market data into one text packet."""
 
         def fc_line(name: str, fc: Optional[dict]) -> str:
             if not fc:
@@ -241,7 +311,6 @@ class WeatherCouncil:
             )
 
         w = weather_data
-        m = market_data
 
         nws_high = w.get("nws_high")
         nws_line = (
@@ -260,23 +329,20 @@ class WeatherCouncil:
             f"spread(stdev)={w.get('ensemble_spread')}°F  "
             f"total_members={w.get('n_members')}  models={w.get('n_models')}",
             f"  NWS OFFICIAL forecast high: {nws_line}",
-            "  NOTE: NWS is the LITERAL settlement source for this market.",
+            "  NOTE: NWS is the LITERAL settlement source for these markets.",
             "",
-            "=== KALSHI MARKET ===",
-            f"  Ticker: {m.get('ticker')}",
-            f"  Title: {m.get('title')}",
-            f"  Threshold: {m.get('threshold_label')}",
-            f"  YES ask (cost to buy YES): ${m.get('yes_price')}",
-            f"  NO ask (cost to buy NO):  ${m.get('no_price')}",
-            f"  Bid/ask spread: ${m.get('spread')}",
-            f"  Market-implied P(YES): {m.get('market_prob')}",
-            f"  Volume: {m.get('volume')}",
-            f"  Close time: {m.get('close_time')}",
-            f"  Hours to settlement: {m.get('hours_to_settlement')}",
+            "=== KALSHI EVENT — ALL BRACKETS ===",
+            self._bracket_table(event_data),
+            "",
+            "  The brackets are mutually exclusive: exactly ONE settles YES",
+            "  (the one containing the observed NWS daily high, integer °F).",
+            "  In your trades, use the full ticker exactly as given above.",
             "",
             "=== QUESTION ===",
-            f"  Should we buy YES or NO on \"{m.get('title')}\"?",
-            "  What is the TRUE probability this market settles YES?",
+            "  Given the weather data and these market prices, what temperature",
+            "  do you predict for the NYC high? Which bracket(s) would you",
+            "  trade? For each bracket you'd trade, specify: buy YES or NO,",
+            "  and why.",
         ]
         return "\n".join(lines)
 
@@ -288,26 +354,30 @@ class WeatherCouncil:
         "You are a quantitative weather-derivatives analyst serving on a "
         "decision council. You price NWS-settled daily-high temperature "
         "markets on Kalshi. You are given ensemble forecasts (GFS, ICON), "
-        "the official NWS forecast (the literal settlement source), and live "
-        "market prices. Estimate the TRUE probability the market settles YES, "
-        "and decide whether buying YES or NO is the better value at the quoted "
-        "price. Reason explicitly about: ensemble spread/uncertainty, how much "
-        "to trust NWS vs the raw ensembles, and the market's implied "
-        "probability. Be calibrated and concrete. Respond with ONLY a JSON "
-        "object, no prose outside it."
+        "the official NWS forecast (the literal settlement source), and the "
+        "FULL set of temperature brackets for one event with live YES/NO "
+        "prices. First predict the daily high, then pick which brackets are "
+        "mispriced relative to your prediction and the forecast uncertainty. "
+        "Reason explicitly about: ensemble spread, how much to trust NWS vs "
+        "the raw ensembles, and what each bracket's price implies. Be "
+        "calibrated and concrete. Respond with ONLY a JSON object, no prose "
+        "outside it."
     )
 
     _STAGE1_SCHEMA = (
         'Respond with ONLY this JSON:\n'
         '{\n'
-        '  "probability": <float 0..1, your P(market settles YES)>,\n'
-        '  "side": "yes" | "no",   // the better BUY at current prices\n'
-        '  "confidence": <float 0..1, how sure you are>,\n'
-        '  "reasoning": "<your full reasoning chain>"\n'
+        '  "predicted_high_f": <float, your predicted NYC daily high in °F>,\n'
+        '  "confidence": <float 0..1, how sure you are of the prediction>,\n'
+        '  "trades": [\n'
+        '    {"ticker": "<full bracket ticker>", "side": "yes" | "no",\n'
+        '     "reasoning": "<why this bracket at this price>"},\n'
+        '    ...  // the bracket(s) you would trade, usually 1-3\n'
+        '  ]\n'
         '}'
     )
 
-    def _run_stage1(self, context: str) -> list[Stage1Answer]:
+    def _run_stage1(self, context: str, valid_tickers: set[str]) -> list[Stage1Answer]:
         answers: list[Stage1Answer] = []
         user_prompt = f"{context}\n\n{self._STAGE1_SCHEMA}{_CONCISE}"
         for i, model in enumerate(self.council_models):
@@ -324,20 +394,20 @@ class WeatherCouncil:
                 answers.append(Stage1Answer(
                     model=model,
                     label=label,
-                    probability=_clamp01(_to_float(p.get("probability"))),
-                    side=_norm_side(p.get("side")),
+                    predicted_high_f=_to_float(p.get("predicted_high_f")),
                     confidence=_clamp01(_to_float(p.get("confidence"))),
-                    reasoning=_as_text(p.get("reasoning")),
+                    trades=_parse_trades(p.get("trades"), valid_tickers),
                     raw_text=resp.raw_text,
                     cost_usd=resp.cost_usd,
                 ))
                 logger.info("council_stage1", model=model, label=label,
-                            prob=answers[-1].probability, side=answers[-1].side)
+                            predicted_high=answers[-1].predicted_high_f,
+                            n_trades=len(answers[-1].trades))
             except Exception as e:
                 logger.warning("council_stage1_failed", model=model, error=str(e)[:200])
                 answers.append(Stage1Answer(
-                    model=model, label=label, probability=None, side="yes",
-                    confidence=None, reasoning="", error=str(e)[:300],
+                    model=model, label=label, predicted_high_f=None,
+                    confidence=None, error=str(e)[:300],
                 ))
         return answers
 
@@ -349,20 +419,25 @@ class WeatherCouncil:
         "You are on a weather-market analyst council. You have already given "
         "your own independent analysis. Below is the WHOLE panel's analysis, "
         "ANONYMIZED (you cannot tell which one is yours or who wrote any of "
-        "them). Critically review the panel's reasoning: where do you agree, "
-        "where do you disagree, and does anyone raise a point that should move "
-        "your probability? Update your probability if the arguments warrant it "
-        "— but do not cave to consensus without a real reason. Respond with "
-        "ONLY a JSON object."
+        "them) — each member's predicted high temperature and the bracket "
+        "trades they selected. Critically review the panel: where do you "
+        "agree, where do you disagree, and does anyone raise a point that "
+        "should move your prediction or change which brackets you'd trade? "
+        "Update if the arguments warrant it — but do not cave to consensus "
+        "without a real reason. Respond with ONLY a JSON object."
     )
 
     _STAGE2_SCHEMA = (
         'Respond with ONLY this JSON:\n'
         '{\n'
-        '  "updated_probability": <float 0..1, your revised P(YES)>,\n'
+        '  "updated_predicted_high_f": <float, your revised predicted high °F>,\n'
+        '  "updated_trades": [\n'
+        '    {"ticker": "<full bracket ticker>", "side": "yes" | "no",\n'
+        '     "reasoning": "<why>"},\n'
+        '    ...\n'
+        '  ],\n'
         '  "agreements": "<points you agree with>",\n'
-        '  "disagreements": "<points you disagree with>",\n'
-        '  "reasoning": "<why you updated or held your estimate>"\n'
+        '  "disagreements": "<points you disagree with>"\n'
         '}'
     )
 
@@ -374,13 +449,15 @@ class WeatherCouncil:
                 continue
             blocks.append(
                 f"{a.label}:\n"
-                f"  P(YES) = {a.probability}  side = {a.side.upper()}  "
+                f"  Predicted high = {a.predicted_high_f}°F  "
                 f"confidence = {a.confidence}\n"
-                f"  Reasoning: {a.reasoning}"
+                f"  Trades:\n{_trades_text(a.trades)}"
             )
         return "\n\n".join(blocks)
 
-    def _run_stage2(self, context: str, stage1: list[Stage1Answer]) -> list[Stage2Review]:
+    def _run_stage2(
+        self, context: str, stage1: list[Stage1Answer], valid_tickers: set[str],
+    ) -> list[Stage2Review]:
         panel = self._format_stage1_panel(stage1)
         reviews: list[Stage2Review] = []
         for i, model in enumerate(self.council_models):
@@ -402,20 +479,21 @@ class WeatherCouncil:
                 reviews.append(Stage2Review(
                     model=model,
                     label=label,
-                    updated_probability=_clamp01(_to_float(p.get("updated_probability"))),
+                    updated_predicted_high_f=_to_float(p.get("updated_predicted_high_f")),
+                    updated_trades=_parse_trades(p.get("updated_trades"), valid_tickers),
                     agreements=_as_text(p.get("agreements")),
                     disagreements=_as_text(p.get("disagreements")),
-                    reasoning=_as_text(p.get("reasoning")),
                     raw_text=resp.raw_text,
                     cost_usd=resp.cost_usd,
                 ))
                 logger.info("council_stage2", model=model, label=label,
-                            updated_prob=reviews[-1].updated_probability)
+                            updated_high=reviews[-1].updated_predicted_high_f,
+                            n_trades=len(reviews[-1].updated_trades))
             except Exception as e:
                 logger.warning("council_stage2_failed", model=model, error=str(e)[:200])
                 reviews.append(Stage2Review(
-                    model=model, label=label, updated_probability=None,
-                    agreements="", disagreements="", reasoning="", error=str(e)[:300],
+                    model=model, label=label, updated_predicted_high_f=None,
+                    error=str(e)[:300],
                 ))
         return reviews
 
@@ -424,27 +502,33 @@ class WeatherCouncil:
     # ------------------------------------------------------------------
 
     _STAGE3_SYSTEM = (
-        "You are the CHAIRMAN of a weather-market analyst council. You see the "
-        "council's independent analyses (Stage 1) and their anonymized peer "
-        "reviews (Stage 2). Synthesize them into one final decision. Weigh the "
-        "NWS official forecast heavily — it is the literal settlement source. "
-        "Treat disagreement among analysts as a genuine risk signal: a divided "
-        "council should lower confidence and the bar for trading. Only set "
-        "should_trade=true when the synthesized probability gives a real edge "
-        "over the market price AND the council is reasonably aligned. Respond "
-        "with ONLY a JSON object."
+        "You are the CHAIRMAN of a weather-market analyst council. You see "
+        "the council's independent analyses (Stage 1) and their anonymized "
+        "peer reviews (Stage 2). Synthesize them into one final decision: a "
+        "predicted high temperature and the bracket trades to place. Weigh "
+        "the NWS official forecast heavily — it is the literal settlement "
+        "source. Treat disagreement among analysts as a genuine risk signal "
+        "and fold it into each trade's win probability. You MUST select at "
+        "least one bracket to trade. This is a research study measuring "
+        "council accuracy — skipping is not an option. If nothing looks "
+        "mispriced, pick the trade(s) you most believe in at the quoted "
+        "prices. Respond with ONLY a JSON object."
     )
 
     _STAGE3_SCHEMA = (
         'Respond with ONLY this JSON:\n'
         '{\n'
-        '  "final_probability": <float 0..1, synthesized P(YES)>,\n'
+        '  "predicted_high_f": <float, final predicted NYC daily high °F>,\n'
         '  "confidence": <float 0..1>,\n'
-        '  "should_trade": true | false,\n'
-        '  "side": "yes" | "no",\n'
+        '  "trades": [\n'
+        '    {"ticker": "<full bracket ticker>", "side": "yes" | "no",\n'
+        '     "probability": <float 0..1, P(this trade WINS — the side you chose settles correct)>,\n'
+        '     "reasoning": "<why this trade>"},\n'
+        '    ...  // AT LEAST ONE trade — skipping is not allowed\n'
+        '  ],\n'
         '  "dissent_summary": "<where/how the council disagreed>",\n'
-        '  "reasoning": "<your synthesis>",\n'
-        '  "risk_factors": "<key risks to this decision>"\n'
+        '  "risk_factors": "<key risks to this decision>",\n'
+        '  "overall_reasoning": "<your synthesis>"\n'
         '}'
     )
 
@@ -456,16 +540,17 @@ class WeatherCouncil:
                 continue
             blocks.append(
                 f"{r.label} (updated):\n"
-                f"  Updated P(YES) = {r.updated_probability}\n"
+                f"  Updated predicted high = {r.updated_predicted_high_f}°F\n"
+                f"  Updated trades:\n{_trades_text(r.updated_trades)}\n"
                 f"  Agreements: {r.agreements}\n"
-                f"  Disagreements: {r.disagreements}\n"
-                f"  Reasoning: {r.reasoning}"
+                f"  Disagreements: {r.disagreements}"
             )
         return "\n\n".join(blocks)
 
     def _run_stage3(
         self, context: str,
         stage1: list[Stage1Answer], stage2: list[Stage2Review],
+        valid_tickers: set[str],
     ) -> Stage3Synthesis:
         s1_panel = self._format_stage1_panel(stage1)
         s2_panel = self._format_stage2_panel(stage2)
@@ -486,40 +571,92 @@ class WeatherCouncil:
             p = resp.parsed
             return Stage3Synthesis(
                 model=self.chairman_model,
-                final_probability=_clamp01(_to_float(p.get("final_probability"))),
+                predicted_high_f=_to_float(p.get("predicted_high_f")),
                 confidence=_clamp01(_to_float(p.get("confidence"))),
-                should_trade=_truthy(p.get("should_trade")),
-                side=_norm_side(p.get("side")),
+                trades=_parse_trades(p.get("trades"), valid_tickers, with_probability=True),
                 dissent_summary=_as_text(p.get("dissent_summary")),
-                reasoning=_as_text(p.get("reasoning")),
                 risk_factors=_as_text(p.get("risk_factors")),
+                overall_reasoning=_as_text(p.get("overall_reasoning")),
                 raw_text=resp.raw_text,
                 cost_usd=resp.cost_usd,
             )
         except Exception as e:
             logger.warning("council_stage3_failed", model=self.chairman_model, error=str(e)[:200])
             return Stage3Synthesis(
-                model=self.chairman_model, final_probability=None, confidence=None,
-                should_trade=False, side="yes", dissent_summary="", reasoning="",
-                risk_factors="", error=str(e)[:300],
+                model=self.chairman_model, predicted_high_f=None, confidence=None,
+                error=str(e)[:300],
             )
+
+    # ------------------------------------------------------------------
+    # Mandatory-trade backstop
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fallback_trade(stage3: Stage3Synthesis, event_data: dict) -> Optional[TradeCall]:
+        """
+        The chairman must always trade. If it returned zero VALID trades
+        (refused, hallucinated tickers, or errored), synthesize one
+        deterministically: buy YES on the bracket containing (or nearest to)
+        the best available predicted high. Marked as a fallback in the
+        reasoning so research analysis can separate these rows.
+        """
+        brackets = event_data.get("brackets", [])
+        if not brackets:
+            return None
+
+        predicted = stage3.predicted_high_f
+
+        def _dist(b: dict) -> float:
+            if predicted is None:
+                return 0.0
+            lo, hi = b.get("floor_strike"), b.get("cap_strike")
+            if b["type"] == "band":
+                if float(lo) <= predicted <= float(hi):
+                    return 0.0
+                return min(abs(predicted - float(lo)), abs(predicted - float(hi)))
+            if b["type"] == "above":
+                return 0.0 if predicted > float(lo) else float(lo) - predicted
+            return 0.0 if predicted < float(hi) else predicted - float(hi)  # below
+
+        target = min(brackets, key=_dist) if predicted is not None else max(
+            brackets, key=lambda b: float(b["market_prob"]))
+        return TradeCall(
+            ticker=target["ticker"],
+            side="yes",
+            probability=None,
+            reasoning=(
+                "FALLBACK: chairman returned no valid trade "
+                f"({'error: ' + stage3.error if stage3.error else 'empty/invalid trades list'}); "
+                f"auto-selected the bracket nearest predicted high "
+                f"{predicted}°F."
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
 
-    def run_council(self, weather_data: dict, market_data: dict) -> CouncilResult:
-        """Run all three stages and assemble the full CouncilResult."""
-        context = self._build_context(weather_data, market_data)
-        ticker = market_data.get("ticker", "")
-        title = market_data.get("title", "")
+    def run_council(self, weather_data: dict, event_data: dict) -> CouncilEventResult:
+        """Run all three stages on the whole event and assemble the result."""
+        context = self._build_context(weather_data, event_data)
+        valid_tickers = {b["ticker"] for b in event_data.get("brackets", [])}
+        event_date = event_data.get("event_date")
+        event_date_iso = event_date.isoformat() if isinstance(event_date, date) else str(event_date)
 
-        logger.info("council_start", ticker=ticker, models=self.council_models,
+        logger.info("council_start", event_date=event_date_iso,
+                    n_brackets=len(valid_tickers), models=self.council_models,
                     chairman=self.chairman_model)
 
-        stage1 = self._run_stage1(context)
-        stage2 = self._run_stage2(context, stage1)
-        stage3 = self._run_stage3(context, stage1, stage2)
+        stage1 = self._run_stage1(context, valid_tickers)
+        stage2 = self._run_stage2(context, stage1, valid_tickers)
+        stage3 = self._run_stage3(context, stage1, stage2, valid_tickers)
+
+        # Mandatory-trade backstop: the council ALWAYS produces ≥1 trade.
+        if not stage3.trades:
+            fb = self._fallback_trade(stage3, event_data)
+            if fb:
+                logger.warning("council_fallback_trade", ticker=fb.ticker)
+                stage3.trades = [fb]
 
         total_cost = (
             sum(a.cost_usd for a in stage1)
@@ -529,16 +666,15 @@ class WeatherCouncil:
 
         all_reasoning = self._assemble_reasoning(stage1, stage2, stage3)
 
-        result = CouncilResult(
-            ticker=ticker,
-            market_title=title,
+        result = CouncilEventResult(
+            event_date=event_date_iso,
+            series_ticker=event_data.get("series_ticker", ""),
             stage1_results=stage1,
             stage2_results=stage2,
             stage3_result=stage3,
-            final_probability=stage3.final_probability,
-            side=stage3.side,
-            should_trade=stage3.should_trade,
+            predicted_high_f=stage3.predicted_high_f,
             confidence=stage3.confidence,
+            trades=stage3.trades,
             total_cost=total_cost,
             all_reasoning=all_reasoning,
             council_models=list(self.council_models),
@@ -546,8 +682,9 @@ class WeatherCouncil:
         )
 
         logger.info(
-            "council_done", ticker=ticker, final_prob=result.final_probability,
-            side=result.side, should_trade=result.should_trade,
+            "council_done", event_date=event_date_iso,
+            predicted_high=result.predicted_high_f,
+            n_trades=len(result.trades),
             confidence=result.confidence, total_cost=round(total_cost, 5),
         )
         return result
@@ -562,115 +699,141 @@ class WeatherCouncil:
             parts.append(
                 f"[{a.label} / {a.model}] "
                 + (f"ERROR: {a.error}" if a.error
-                   else f"P(YES)={a.probability} side={a.side} conf={a.confidence}\n{a.reasoning}")
+                   else f"predicted_high={a.predicted_high_f}°F conf={a.confidence}\n"
+                        f"{_trades_text(a.trades)}")
             )
         parts.append("\n### STAGE 2 — PEER REVIEW")
         for r in stage2:
             parts.append(
                 f"[{r.label} / {r.model}] "
                 + (f"ERROR: {r.error}" if r.error
-                   else f"updated P(YES)={r.updated_probability}\n"
+                   else f"updated_high={r.updated_predicted_high_f}°F\n"
+                        f"{_trades_text(r.updated_trades)}\n"
                         f"agreements: {r.agreements}\n"
-                        f"disagreements: {r.disagreements}\n{r.reasoning}")
+                        f"disagreements: {r.disagreements}")
             )
         parts.append("\n### STAGE 3 — CHAIRMAN SYNTHESIS")
         parts.append(
             f"[{stage3.model}] "
             + (f"ERROR: {stage3.error}" if stage3.error
-               else f"final P(YES)={stage3.final_probability} conf={stage3.confidence} "
-                    f"should_trade={stage3.should_trade} side={stage3.side}\n"
+               else f"final predicted_high={stage3.predicted_high_f}°F conf={stage3.confidence}\n"
+                    f"{_trades_text(stage3.trades)}\n"
                     f"dissent: {stage3.dissent_summary}\n"
-                    f"risk_factors: {stage3.risk_factors}\n{stage3.reasoning}")
+                    f"risk_factors: {stage3.risk_factors}\n{stage3.overall_reasoning}")
         )
         return "\n\n".join(parts)
 
 
 # ----------------------------------------------------------------------
-# Persistence — write one council_decisions row (research audit trail)
+# Persistence — one council_decisions row PER TRADE (research audit trail)
 # ----------------------------------------------------------------------
 
-def persist_council_decision(
-    result: CouncilResult,
-    market_yes_price: Decimal | float | None,
-    market_no_price: Decimal | float | None,
-    edge: Decimal | float | None,
-    weather_nws_high: Optional[int],
-) -> Optional[int]:
-    """
-    Write the full council run to council_decisions. Returns the new row id,
-    or None on failure (logged, never raised — logging must not break trading).
+def _stage1_blob(a: Stage1Answer) -> str:
+    if a.error:
+        return a.error
+    return (
+        f"PREDICTED HIGH: {a.predicted_high_f}°F (confidence {a.confidence})\n"
+        f"TRADES:\n{_trades_text(a.trades)}"
+    )
 
-    Stage-1/2 answers are stored POSITIONALLY: stage1_results[0] -> model_a,
-    [1] -> model_b, [2] -> model_c, matching the A/B/C labels.
+
+def _stage2_blob(r: Stage2Review) -> str:
+    if r.error:
+        return r.error
+    return (
+        f"UPDATED PREDICTED HIGH: {r.updated_predicted_high_f}°F\n"
+        f"UPDATED TRADES:\n{_trades_text(r.updated_trades)}\n"
+        f"AGREEMENTS: {r.agreements}\n"
+        f"DISAGREEMENTS: {r.disagreements}"
+    )
+
+
+def persist_event_decision(
+    result: CouncilEventResult,
+    event_data: dict,
+    weather_nws_high: Optional[int],
+) -> list[int]:
+    """
+    Write one council_decisions row per chairman trade, all sharing a fresh
+    council_run_id (UUID). Stage-1/2/3 reasoning is duplicated across the
+    run's rows; per-trade fields (ticker, side, P(win), trade reasoning,
+    prices, edge) differ per row.
+
+    Returns the new row ids ([] on failure — logged, never raised; logging
+    must not break the research loop).
     """
     from data.db import CouncilDecision, get_session
-
-    def s1(idx: int) -> Stage1Answer | None:
-        return result.stage1_results[idx] if idx < len(result.stage1_results) else None
-
-    def s2(idx: int) -> Stage2Review | None:
-        return result.stage2_results[idx] if idx < len(result.stage2_results) else None
 
     def _num(v) -> Optional[Decimal]:
         return None if v is None else Decimal(str(v))
 
-    a1, b1, c1 = s1(0), s1(1), s1(2)
-    a2, b2, c2 = s2(0), s2(1), s2(2)
+    def sN(items: list, idx: int):
+        return items[idx] if idx < len(items) else None
+
+    a1, b1, c1 = sN(result.stage1_results, 0), sN(result.stage1_results, 1), sN(result.stage1_results, 2)
+    a2, b2, c2 = sN(result.stage2_results, 0), sN(result.stage2_results, 1), sN(result.stage2_results, 2)
     s3 = result.stage3_result
+
+    bracket_by_ticker = {b["ticker"]: b for b in event_data.get("brackets", [])}
+    run_id = str(uuid.uuid4())
+    row_ids: list[int] = []
 
     session = get_session()
     try:
-        row = CouncilDecision(
-            ticker=result.ticker,
-            market_title=result.market_title,
-            stage1_model_a_prob=_num(a1.probability) if a1 else None,
-            stage1_model_a_side=a1.side if a1 else None,
-            stage1_model_a_reasoning=(a1.reasoning or a1.error) if a1 else None,
-            stage1_model_b_prob=_num(b1.probability) if b1 else None,
-            stage1_model_b_side=b1.side if b1 else None,
-            stage1_model_b_reasoning=(b1.reasoning or b1.error) if b1 else None,
-            stage1_model_c_prob=_num(c1.probability) if c1 else None,
-            stage1_model_c_side=c1.side if c1 else None,
-            stage1_model_c_reasoning=(c1.reasoning or c1.error) if c1 else None,
-            stage2_model_a_updated_prob=_num(a2.updated_probability) if a2 else None,
-            stage2_model_a_reasoning=_stage2_text(a2) if a2 else None,
-            stage2_model_b_updated_prob=_num(b2.updated_probability) if b2 else None,
-            stage2_model_b_reasoning=_stage2_text(b2) if b2 else None,
-            stage2_model_c_updated_prob=_num(c2.updated_probability) if c2 else None,
-            stage2_model_c_reasoning=_stage2_text(c2) if c2 else None,
-            stage3_final_prob=_num(s3.final_probability),
-            stage3_confidence=_num(s3.confidence),
-            stage3_should_trade=1 if s3.should_trade else 0,
-            stage3_side=s3.side,
-            stage3_reasoning=s3.reasoning or s3.error,
-            stage3_dissent_summary=s3.dissent_summary,
-            stage3_risk_factors=s3.risk_factors,
-            market_yes_price=_num(market_yes_price),
-            market_no_price=_num(market_no_price),
-            edge=_num(edge),
-            weather_nws_high=weather_nws_high,
-            council_models=result.council_models,
-            chairman_model=result.chairman_model,
-            total_cost_usd=_num(round(result.total_cost, 6)),
-            created_at=datetime.now(timezone.utc),
-        )
-        session.add(row)
+        for trade in result.trades:
+            bracket = bracket_by_ticker.get(trade.ticker, {})
+            yes_price = bracket.get("yes_price")
+            no_price = bracket.get("no_price")
+
+            # Edge = P(win) − entry cost on the chosen side. Descriptive only.
+            edge = None
+            if trade.probability is not None:
+                entry = yes_price if trade.side == "yes" else no_price
+                if entry is not None:
+                    edge = Decimal(str(trade.probability)) - Decimal(str(entry))
+
+            row = CouncilDecision(
+                council_run_id=run_id,
+                ticker=trade.ticker,
+                market_title=bracket.get("title") or bracket.get("threshold") or trade.ticker,
+                predicted_high_f=_num(result.predicted_high_f),
+                stage1_model_a_predicted_high=_num(a1.predicted_high_f) if a1 else None,
+                stage1_model_b_predicted_high=_num(b1.predicted_high_f) if b1 else None,
+                stage1_model_c_predicted_high=_num(c1.predicted_high_f) if c1 else None,
+                stage2_model_a_updated_high=_num(a2.updated_predicted_high_f) if a2 else None,
+                stage2_model_b_updated_high=_num(b2.updated_predicted_high_f) if b2 else None,
+                stage2_model_c_updated_high=_num(c2.updated_predicted_high_f) if c2 else None,
+                stage1_model_a_reasoning=_stage1_blob(a1) if a1 else None,
+                stage1_model_b_reasoning=_stage1_blob(b1) if b1 else None,
+                stage1_model_c_reasoning=_stage1_blob(c1) if c1 else None,
+                stage2_model_a_reasoning=_stage2_blob(a2) if a2 else None,
+                stage2_model_b_reasoning=_stage2_blob(b2) if b2 else None,
+                stage2_model_c_reasoning=_stage2_blob(c2) if c2 else None,
+                stage3_final_prob=_num(trade.probability),
+                stage3_confidence=_num(s3.confidence),
+                stage3_should_trade=1,
+                stage3_side=trade.side,
+                stage3_reasoning=s3.overall_reasoning or s3.error,
+                stage3_dissent_summary=s3.dissent_summary,
+                stage3_risk_factors=s3.risk_factors,
+                trade_reasoning=trade.reasoning,
+                market_yes_price=_num(yes_price),
+                market_no_price=_num(no_price),
+                edge=edge,
+                weather_nws_high=weather_nws_high,
+                council_models=result.council_models,
+                chairman_model=result.chairman_model,
+                total_cost_usd=_num(round(result.total_cost, 6)),
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(row)
+            session.flush()
+            row_ids.append(row.id)
         session.commit()
-        return row.id
+        return row_ids
     except Exception as e:
         session.rollback()
-        logger.warning("council_persist_failed", ticker=result.ticker, error=str(e)[:200])
-        return None
+        logger.warning("council_persist_failed", run_id=run_id, error=str(e)[:200])
+        return []
     finally:
         session.close()
-
-
-def _stage2_text(r: Stage2Review) -> str:
-    """Fold a Stage-2 review's structured fields into one stored reasoning blob."""
-    if r.error:
-        return r.error
-    return (
-        f"AGREEMENTS: {r.agreements}\n"
-        f"DISAGREEMENTS: {r.disagreements}\n"
-        f"REASONING: {r.reasoning}"
-    )

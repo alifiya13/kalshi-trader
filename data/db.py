@@ -167,11 +167,18 @@ class DebateLog(Base):
 
 class CouncilDecision(Base):
     """
-    Full audit trail of one 3-stage WeatherCouncil run (agents/council.py).
+    One TRADE recommended by a 3-stage WeatherCouncil run (agents/council.py).
+
+    Event-level model (2026-06-06): the council runs ONCE per weather event,
+    sees ALL brackets, and recommends 1+ trades. Each recommended trade gets
+    its own row; rows from the same run share a `council_run_id` (UUID) and
+    the same stage-1/2/3 reasoning blobs. Per-trade fields (`ticker`,
+    `stage3_final_prob` = P(this trade wins), `stage3_side`,
+    `trade_reasoning`, prices, `edge`) differ per row.
 
     The council (adapted from Karpathy's llm-council) is a research instrument
     for studying *failure modes*, so we persist every stage and every model's
-    probability + reasoning chain. The Stage-1/2 columns are POSITIONAL
+    prediction + reasoning chain. The Stage-1/2 columns are POSITIONAL
     (model_a / model_b / model_c) — the A/B/C labels map to
     WeatherCouncil.council_models in order (also stored verbatim in the
     `council_models` JSON column). Outcome columns (market_result,
@@ -181,10 +188,22 @@ class CouncilDecision(Base):
     __tablename__ = "council_decisions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    council_run_id = Column(String, index=True)   # UUID — groups trades from one run
     ticker = Column(String, index=True)
     market_title = Column(Text)
 
+    # --- Event-level temperature predictions (shared across the run) ---
+    predicted_high_f = Column(Numeric, nullable=True)   # chairman's final prediction
+    stage1_model_a_predicted_high = Column(Numeric, nullable=True)
+    stage1_model_b_predicted_high = Column(Numeric, nullable=True)
+    stage1_model_c_predicted_high = Column(Numeric, nullable=True)
+    stage2_model_a_updated_high = Column(Numeric, nullable=True)
+    stage2_model_b_updated_high = Column(Numeric, nullable=True)
+    stage2_model_c_updated_high = Column(Numeric, nullable=True)
+
     # --- Stage 1: independent analysis (positional A/B/C) ---
+    # prob/side are legacy (per-bracket era); reasoning now holds the model's
+    # predicted high + full trade list as one blob.
     stage1_model_a_prob = Column(Numeric)
     stage1_model_a_side = Column(String)
     stage1_model_a_reasoning = Column(Text)
@@ -195,7 +214,7 @@ class CouncilDecision(Base):
     stage1_model_c_side = Column(String)
     stage1_model_c_reasoning = Column(Text)
 
-    # --- Stage 2: peer review (updated probabilities) ---
+    # --- Stage 2: peer review (updated predictions) ---
     stage2_model_a_updated_prob = Column(Numeric)
     stage2_model_a_reasoning = Column(Text)
     stage2_model_b_updated_prob = Column(Numeric)
@@ -204,13 +223,14 @@ class CouncilDecision(Base):
     stage2_model_c_reasoning = Column(Text)
 
     # --- Stage 3: chairman synthesis ---
-    stage3_final_prob = Column(Numeric)
+    stage3_final_prob = Column(Numeric)     # P(this trade WINS) — per trade
     stage3_confidence = Column(Numeric)
-    stage3_should_trade = Column(Integer)   # 0/1 (no native bool on SQLite)
-    stage3_side = Column(String)            # "yes" | "no"
-    stage3_reasoning = Column(Text)
+    stage3_should_trade = Column(Integer)   # always 1 now (council must trade)
+    stage3_side = Column(String)            # "yes" | "no" — per trade
+    stage3_reasoning = Column(Text)         # chairman's OVERALL synthesis (shared)
     stage3_dissent_summary = Column(Text)
     stage3_risk_factors = Column(Text)
+    trade_reasoning = Column(Text)          # chairman's reasoning for THIS trade
 
     # --- Market snapshot + edge at decision time ---
     market_yes_price = Column(Numeric)

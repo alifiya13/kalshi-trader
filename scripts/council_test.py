@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Council smoke test — run the 3-stage WeatherCouncil on ONE real KXHIGHNY
-market and print the FULL output: every stage, every model's reasoning, the
-final decision.
+Council event test — run the 3-stage WeatherCouncil ONCE on tomorrow's
+KXHIGHNY event (ALL brackets at once) and print the FULL output: the
+bracket table the council saw, every model's predicted temperature, every
+stage's reasoning, the chairman's final trades.
 
-This DOES NOT TRADE and does NOT write to the database. It only reads live
-market data + forecasts and runs the LLMs.
+This WRITES to the database — one council_decisions row per chairman trade
+(grouped by council_run_id) and one paper position per trade — because the
+research study requires every council decision to be measurable.
 
 Run:
-  python -m scripts.council_test                 # auto-pick best edge market
-  python -m scripts.council_test KXHIGHNY-...    # a specific ticker
+  python -m scripts.council_test            # log decisions + paper trades
+  python -m scripts.council_test --no-db    # print only, write nothing
 """
 
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -26,85 +29,57 @@ from rich.panel import Panel
 from rich.rule import Rule
 
 from core.rest_client import get_data_client
-from strategies.weather import find_weather_edge, get_weather_context, parse_ticker_date
-from agents.council import WeatherCouncil
+from data.db import Position, get_session, init_db
+from strategies.weather import get_weather_context, get_weather_event_with_brackets
+from agents.council import WeatherCouncil, persist_event_decision
 
 console = Console(width=120)
 
-
-def _build_market_data(sig, raw: dict | None) -> dict:
-    yes_bid = sig.market_yes_bid
-    yes_ask = sig.market_yes_ask
-    yes_price = yes_ask if yes_ask > 0 else sig.market_prob
-    no_price = (Decimal("1") - yes_bid) if yes_bid > 0 else (Decimal("1") - yes_price)
-    spread = (yes_ask - yes_bid) if (yes_ask > 0 and yes_bid > 0) else None
-    raw = raw or {}
-    return {
-        "ticker": sig.ticker,
-        "title": raw.get("title") or sig.title,
-        "threshold_label": sig.threshold_label,
-        "yes_price": yes_price,
-        "no_price": no_price,
-        "spread": spread,
-        "market_prob": float(sig.market_prob),
-        "volume": raw.get("volume"),
-        "close_time": raw.get("close_time"),
-        "hours_to_settlement": None,
-    }
+PAPER_CONTRACTS = 10  # mirror active_trader's fixed research size
 
 
 def main() -> int:
-    want_ticker = sys.argv[1] if len(sys.argv) > 1 else None
+    write_db = "--no-db" not in sys.argv
 
-    console.print(Rule("[bold magenta]WeatherCouncil — live smoke test (NO TRADE)"))
+    console.print(Rule("[bold magenta]WeatherCouncil — event-level test"))
     client = get_data_client()
+    init_db()
 
-    # Raw open markets, for volume/close_time + ticker lookup.
-    resp = client.get_markets(series_ticker="KXHIGHNY", status="open", limit=200)
-    raw_by_ticker = {m.get("ticker"): m for m in resp.get("markets", [])}
-
-    # Score every market; pick the highest-edge one (or the requested ticker).
-    signals = find_weather_edge(client, min_edge=Decimal("0"))
-    if not signals:
-        console.print("[red]No KXHIGHNY signals scored (no target-date markets or no ensemble). "
-                      "Try again closer to a trading day.[/]")
+    # --- The event: tomorrow's NYC high, all brackets ---
+    event = get_weather_event_with_brackets(client)
+    if not event:
+        console.print("[red]No active KXHIGHNY event for tomorrow. Try later.[/]")
         return 1
 
-    if want_ticker:
-        sig = next((s for s in signals if s.ticker == want_ticker), None)
-        if sig is None:
-            console.print(f"[red]Ticker {want_ticker} not found among scored signals.[/]")
-            console.print("Available:", ", ".join(s.ticker for s in signals[:20]))
-            return 1
-    else:
-        # Highest signed edge — the market the weather model likes most.
-        sig = signals[0]
+    console.print(f"\n[bold]Event:[/] {event['series_ticker']} {event['event_date']}")
+    console.print(Panel(WeatherCouncil._bracket_table(event),
+                        title="Bracket table (as the council sees it)",
+                        border_style="blue"))
 
-    console.print(f"[bold]Selected market:[/] {sig.ticker}")
-    console.print(
-        f"  {sig.title}  ({sig.threshold_label})\n"
-        f"  weather model_prob={float(sig.model_prob):.3f}  market_prob={float(sig.market_prob):.3f}  "
-        f"edge={float(sig.edge):.3f}  side={sig.side.upper()}  confidence={sig.confidence}\n"
-        f"  NWS high={sig.nws_forecast_high}°F  ensemble_mean={sig.ensemble_mean_f}°F  "
-        f"per-model={sig.per_model_probs}"
-    )
-
-    target_date = parse_ticker_date(sig.ticker)
-    console.print(f"\n[dim]Building weather context for {target_date} …[/]")
-    weather_ctx = get_weather_context(target_date=target_date)
+    # --- Weather context ---
+    console.print(f"[dim]Building weather context for {event['event_date']} …[/]")
+    weather_ctx = get_weather_context(target_date=event["event_date"])
     console.print(
         f"[dim]  GFS={weather_ctx['gfs_forecast'] and weather_ctx['gfs_forecast']['mean']}°F  "
         f"ICON={weather_ctx['icon_forecast'] and weather_ctx['icon_forecast']['mean']}°F  "
         f"NWS={weather_ctx['nws_high']}°F  ensemble_mean={weather_ctx['ensemble_mean']}°F  "
         f"spread={weather_ctx['ensemble_spread']}°F  members={weather_ctx['n_members']}[/]")
 
-    market_data = _build_market_data(sig, raw_by_ticker.get(sig.ticker))
-
     council = WeatherCouncil()
     console.print(f"\n[dim]Council: {council.council_models}  chairman: {council.chairman_model}[/]")
     console.print(Rule("[bold cyan]Running council (7 LLM calls)…"))
 
-    result = council.run_council(weather_ctx, market_data)
+    result = council.run_council(weather_ctx, event)
+
+    def trades_block(trades) -> str:
+        if not trades:
+            return "[dim](no trades named)[/]"
+        return "\n".join(
+            f"  • {t.ticker}  [bold]{t.side.upper()}[/]"
+            + (f"  P(win)={t.probability}" if t.probability is not None else "")
+            + f"\n    [dim]{t.reasoning}[/]"
+            for t in trades
+        )
 
     # ---- STAGE 1 ----
     console.print(Rule("[bold]STAGE 1 — Independent Analysis"))
@@ -114,9 +89,9 @@ def main() -> int:
                                 title=f"{a.label} — {a.model}", border_style="red"))
             continue
         console.print(Panel(
-            f"[bold]P(YES) = {a.probability}[/]   side = [bold]{a.side.upper()}[/]   "
+            f"[bold]Predicted high = {a.predicted_high_f}°F[/]   "
             f"confidence = {a.confidence}   cost = ${a.cost_usd:.5f}\n\n"
-            f"{a.reasoning}",
+            f"{trades_block(a.trades)}",
             title=f"{a.label} — {a.model}", border_style="cyan"))
 
     # ---- STAGE 2 ----
@@ -127,44 +102,69 @@ def main() -> int:
                                 title=f"{r.label} — {r.model}", border_style="red"))
             continue
         console.print(Panel(
-            f"[bold]Updated P(YES) = {r.updated_probability}[/]   cost = ${r.cost_usd:.5f}\n\n"
+            f"[bold]Updated predicted high = {r.updated_predicted_high_f}°F[/]   "
+            f"cost = ${r.cost_usd:.5f}\n\n"
+            f"{trades_block(r.updated_trades)}\n\n"
             f"[green]Agreements:[/] {r.agreements}\n\n"
-            f"[yellow]Disagreements:[/] {r.disagreements}\n\n"
-            f"[dim]Reasoning:[/] {r.reasoning}",
+            f"[yellow]Disagreements:[/] {r.disagreements}",
             title=f"{r.label} — {r.model}", border_style="magenta"))
 
     # ---- STAGE 3 ----
     console.print(Rule("[bold]STAGE 3 — Chairman Synthesis"))
     s3 = result.stage3_result
     if s3.error:
-        console.print(Panel(f"[red]ERROR: {s3.error}[/]",
+        console.print(Panel(f"[red]ERROR: {s3.error}[/]\n\n"
+                            f"{trades_block(s3.trades)}",
                             title=f"Chairman — {s3.model}", border_style="red"))
     else:
         console.print(Panel(
-            f"[bold]Final P(YES) = {s3.final_probability}[/]   side = [bold]{s3.side.upper()}[/]\n"
-            f"confidence = {s3.confidence}   should_trade = "
-            f"[bold]{s3.should_trade}[/]   cost = ${s3.cost_usd:.5f}\n\n"
-            f"[bold]Reasoning:[/]\n{s3.reasoning}\n\n"
+            f"[bold]Final predicted high = {s3.predicted_high_f}°F[/]   "
+            f"confidence = {s3.confidence}   cost = ${s3.cost_usd:.5f}\n\n"
+            f"[bold]Trades:[/]\n{trades_block(s3.trades)}\n\n"
+            f"[bold]Overall reasoning:[/]\n{s3.overall_reasoning}\n\n"
             f"[yellow]Dissent summary:[/] {s3.dissent_summary}\n\n"
             f"[red]Risk factors:[/] {s3.risk_factors}",
             title=f"Chairman — {s3.model}", border_style="green"))
 
-    # ---- FINAL DECISION + combined gate (printed, NOT acted on) ----
-    console.print(Rule("[bold]FINAL DECISION"))
-    conf = result.confidence or 0.0
-    edge_ok = sig.edge >= Decimal("0.15")
-    trade_ok = result.should_trade
-    conf_ok = conf > 0.6
-    would_trade = edge_ok and trade_ok and conf_ok
-    console.print(
-        f"  weather edge ≥ 15¢ : {edge_ok}  (edge={float(sig.edge):.3f})\n"
-        f"  council should_trade: {trade_ok}\n"
-        f"  council conf > 0.6  : {conf_ok}  (conf={conf:.2f})\n"
-        f"  [bold]→ combined gate: {'WOULD TRADE' if would_trade else 'NO TRADE'}[/]  "
-        f"(side={result.side.upper()}, final_prob={result.final_probability})"
-    )
     console.print(f"\n  [bold]Total council cost: ${result.total_cost:.5f}[/]")
-    console.print("\n[bold yellow]TEST ONLY — no trade placed, nothing written to the database.[/]")
+
+    if not write_db:
+        console.print("\n[bold yellow]--no-db: nothing written to the database.[/]")
+        return 0
+
+    # ---- Persist: one decision row per trade + one paper position each ----
+    console.print(Rule("[bold]LOGGED TO DATABASE"))
+    row_ids = persist_event_decision(result, event, weather_ctx.get("nws_high"))
+    console.print(f"  council_decisions: {len(row_ids)} row(s) {row_ids}")
+
+    bracket_by_ticker = {b["ticker"]: b for b in event["brackets"]}
+    session = get_session()
+    try:
+        for trade in result.trades:
+            bracket = bracket_by_ticker[trade.ticker]
+            entry_price = bracket["yes_price"] if trade.side == "yes" else bracket["no_price"]
+            if entry_price <= 0 or entry_price >= 1:
+                console.print(f"  [dim]{trade.ticker}: unpriceable ({trade.side} @ ${entry_price}) — no position[/]")
+                continue
+            pos = Position(
+                ticker=trade.ticker,
+                strategy="weather_council",
+                side=trade.side,
+                entry_price=entry_price.quantize(Decimal("0.0001")),
+                contracts=PAPER_CONTRACTS,
+                entry_time=datetime.now(timezone.utc),
+                status="open",
+            )
+            session.add(pos)
+            session.commit()
+            console.print(
+                f"  [green]PAPER TRADE[/] {trade.ticker}  {trade.side.upper()} "
+                f"x{PAPER_CONTRACTS} @ ${entry_price:.2f}  "
+                f"cost=${entry_price * PAPER_CONTRACTS:.2f}  (position id={pos.id})"
+            )
+    finally:
+        session.close()
+
     return 0
 
 

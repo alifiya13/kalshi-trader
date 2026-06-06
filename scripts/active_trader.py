@@ -10,14 +10,16 @@ trade so we can measure how well the council predicts.
 
 Runs continuously:
   - Every 30 minutes: scan the weather EVENT (tomorrow's NYC
-    high), run the council on each bracket, paper-trade every
-    bracket the council says to trade
+    high), run the council ONCE over ALL brackets, paper-trade
+    every trade the council names
   - Every 30 seconds: update prices + evaluate exits
   - Prints live status table to terminal
 
 The market model is EVENT-level: KXHIGHNY-26JUN06 is one event
 with 6-8 mutually exclusive temperature brackets under it. The
-council sees the full bracket picture and decides per bracket.
+council sees the full bracket table in one context packet,
+predicts the high temperature, and MUST name at least one trade
+— skipping is not an option (research mandate).
 
 There are NO trading gates. No edge threshold, no confidence
 floor, no risk engine. The council's decision IS the decision —
@@ -42,7 +44,6 @@ import argparse
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -67,7 +68,7 @@ from rich import box
 from core.rest_client import get_data_client, get_trade_client
 from data.db import Position, get_session, init_db
 from execution.position_manager import PositionManager, ExitAction
-from agents.council import WeatherCouncil, CouncilResult, persist_council_decision
+from agents.council import WeatherCouncil, persist_event_decision
 from strategies.weather import get_weather_context, get_weather_event_with_brackets
 from scripts.settle_council import settle_council_decisions
 from monitoring.telegram_bot import (
@@ -121,57 +122,8 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 
 # ----------------------------------------------------------------------
-# Market-data packet for the council
-# ----------------------------------------------------------------------
-
-def _build_market_data(bracket: dict) -> dict:
-    """
-    Assemble the live-market half of the council's context packet from
-    one bracket of the weather event.
-    """
-    close_time = bracket.get("close_time")
-    hours_to_settlement = None
-    if close_time:
-        try:
-            ct = datetime.fromisoformat(str(close_time).replace("Z", "+00:00"))
-            hours_to_settlement = round((ct - datetime.now(timezone.utc)).total_seconds() / 3600, 1)
-        except (ValueError, AttributeError):
-            pass
-
-    yes_ask = bracket["yes_price"]
-    yes_bid = bracket["yes_bid"]
-    spread = (yes_ask - yes_bid) if (yes_ask > 0 and yes_bid > 0) else None
-
-    return {
-        "ticker": bracket["ticker"],
-        "title": bracket["title"] or bracket["threshold"],
-        "threshold_label": bracket["threshold"],
-        "yes_price": bracket["yes_price"],
-        "no_price": bracket["no_price"],
-        "spread": spread,
-        "market_prob": float(bracket["market_prob"]),
-        "volume": bracket["volume"],
-        "close_time": close_time,
-        "hours_to_settlement": hours_to_settlement,
-    }
-
-
-def _council_edge(result: CouncilResult, bracket: dict) -> Optional[Decimal]:
-    """
-    Edge implied by the council's own probability vs the entry cost on
-    the side it picked. Purely descriptive — logged for research, never
-    used to gate the trade.
-    """
-    if result.final_probability is None:
-        return None
-    p = Decimal(str(result.final_probability))
-    if result.side == "yes":
-        return p - bracket["yes_price"]
-    return (Decimal("1") - p) - bracket["no_price"]
-
-
-# ----------------------------------------------------------------------
-# Main scan — council runs on every bracket; its decision IS the decision
+# Main scan — ONE council run over the whole event; its decision IS the
+# decision
 # ----------------------------------------------------------------------
 
 def scan_for_opportunities(client, pm: PositionManager, dry_run: bool) -> dict:
@@ -192,6 +144,14 @@ def scan_for_opportunities(client, pm: PositionManager, dry_run: bool) -> dict:
         + ", ".join(b["threshold"] for b in brackets) + "[/]"
     )
 
+    _reset_council_budget_if_new_day()
+    if _council_cost_today >= COUNCIL_DAILY_COST_CAP:
+        console.print(
+            f"[yellow]  Council skipped: daily cap hit "
+            f"(${_council_cost_today:.4f} ≥ ${COUNCIL_DAILY_COST_CAP:.2f})[/]"
+        )
+        return empty
+
     # 2. Weather context (ensembles + NWS), fetched once for the event
     try:
         weather_ctx = get_weather_context(target_date=event["event_date"])
@@ -199,81 +159,66 @@ def scan_for_opportunities(client, pm: PositionManager, dry_run: bool) -> dict:
         console.print(f"[yellow]  Weather context failed: {e}[/]")
         return empty
 
-    council = WeatherCouncil()
-    _reset_council_budget_if_new_day()
+    # 3. ONE council run sees the full bracket table and must name ≥1
+    #    trade. No edge gate, no confidence gate, no risk engine — every
+    #    trade it names is logged and paper-traded.
+    try:
+        result = WeatherCouncil().run_council(weather_ctx, event)
+    except Exception as e:
+        console.print(f"[yellow]  Council error: {e}[/]")
+        return empty
+    _council_cost_today += result.total_cost
 
+    # One council_decisions row per trade, grouped by council_run_id.
+    row_ids = persist_event_decision(result, event, weather_ctx.get("nws_high"))
+
+    conf = result.confidence or 0.0
+    console.print(
+        f"  [cyan]council[/] predicted_high={result.predicted_high_f}°F "
+        f"conf={conf:.2f}  {len(result.trades)} trade(s)  "
+        f"cost=${result.total_cost:.4f} "
+        f"(today=${_council_cost_today:.4f}/${COUNCIL_DAILY_COST_CAP:.2f})  "
+        f"logged {len(row_ids)} decision row(s)"
+    )
+
+    # 4. Paper-trade every trade the council named.
+    bracket_by_ticker = {b["ticker"]: b for b in brackets}
     existing = {p.ticker for p in pm.positions if p.status == "open"}
     entries: list[dict] = []
-    council_runs = 0
 
-    # 3. Run the council on every bracket of the event. No edge gate, no
-    #    confidence gate, no risk engine — every decision is logged and
-    #    every should_trade=true becomes a paper trade. Only the daily
-    #    LLM budget can stop the loop.
-    for bracket in brackets:
-        ticker = bracket["ticker"]
-        if ticker in existing:
-            console.print(f"  [dim]{ticker}: already holding — skipped[/]")
-            continue
-        if _council_cost_today >= COUNCIL_DAILY_COST_CAP:
-            console.print(
-                f"[yellow]  Council stopped: daily cap hit "
-                f"(${_council_cost_today:.4f} ≥ ${COUNCIL_DAILY_COST_CAP:.2f})[/]"
-            )
-            break
-
-        market_data = _build_market_data(bracket)
-
-        try:
-            result = council.run_council(weather_ctx, market_data)
-        except Exception as e:
-            console.print(f"[yellow]  Council error on {ticker}: {e}[/]")
-            continue
-        council_runs += 1
-        _council_cost_today += result.total_cost
-
-        edge = _council_edge(result, bracket)
-
-        # Log EVERY council decision, trade or not (research audit trail).
-        persist_council_decision(
-            result,
-            market_yes_price=bracket["yes_price"],
-            market_no_price=bracket["no_price"],
-            edge=edge,
-            weather_nws_high=weather_ctx.get("nws_high"),
-        )
-
-        conf = result.confidence or 0.0
+    for trade in result.trades:
+        bracket = bracket_by_ticker[trade.ticker]  # tickers pre-validated by the council
         console.print(
-            f"  [cyan]council[/] {ticker} [{bracket['threshold']}]: "
-            f"final_prob={result.final_probability} should_trade={result.should_trade} "
-            f"side={result.side} conf={conf:.2f}  cost=${result.total_cost:.4f} "
-            f"(today=${_council_cost_today:.4f}/${COUNCIL_DAILY_COST_CAP:.2f})"
+            f"  [cyan]trade[/] {trade.ticker} [{bracket['threshold']}]: "
+            f"{trade.side.upper()}  P(win)={trade.probability}"
         )
-
-        if not result.should_trade:
+        if trade.ticker in existing:
+            console.print(f"    [dim]already holding — position not duplicated[/]")
             continue
 
-        # --- Council said trade → paper trade, no second-guessing ---
-        entry_price = bracket["yes_price"] if result.side == "yes" else bracket["no_price"]
+        entry_price = bracket["yes_price"] if trade.side == "yes" else bracket["no_price"]
         if entry_price <= 0 or entry_price >= 1:
-            console.print(f"  [dim]{ticker}: unpriceable ({result.side} @ ${entry_price}) — skipped[/]")
+            console.print(f"    [dim]unpriceable ({trade.side} @ ${entry_price}) — no position[/]")
             continue
 
+        edge = (
+            Decimal(str(trade.probability)) - entry_price
+            if trade.probability is not None else Decimal("0")
+        )
         entry = _record_entry(
-            pm, ticker, result.side, entry_price,
+            pm, trade.ticker, trade.side, entry_price,
             PAPER_CONTRACTS, "weather_council", dry_run,
-            edge=edge or Decimal("0"),
+            edge=edge,
         )
         if entry:
             entries.append(entry)
-            existing.add(ticker)
+            existing.add(trade.ticker)
 
     return {
         "entries": entries,
         "num_markets": len(brackets),
-        "num_signals": council_runs,
-        "council_runs": council_runs,
+        "num_signals": len(result.trades),
+        "council_runs": 1,
     }
 
 
